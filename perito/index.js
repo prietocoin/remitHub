@@ -19,6 +19,18 @@ const pool = new Pool({
   database: process.env.DB_NAME,
 });
 
+// En el bloque catch de worker en perito/index.js
+} catch (err) {
+  const detalle = err.response?.data?.error?.message || err.response?.data || err.message;
+  console.error(`[Perito Error DETALLE] ${hash_imagen}:`, detalle);
+
+  await pool.query(
+    `UPDATE registros_raw SET estado = 'FALLO' WHERE hash_imagen = $1`,
+    [hash_imagen]
+  );
+  throw err;
+}
+
 const connection = new Redis({
   host: process.env.REDIS_HOST,
   port: Number(process.env.REDIS_PORT) || 6379,
