@@ -3,14 +3,24 @@ const Redis = require('ioredis');
 const { Pool } = require('pg');
 const axios = require('axios');
 
-// 1. Lectura de variables de entorno y API Key de Gemini
+// 1. Carga de Claves
 const rawKeys = process.env.GEMINI_KEYS || process.env.GEMINI_API_KEY || process.env.GEMINI_KEY || '';
 const geminiKeyList = rawKeys.split(',').map(k => k.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
-const GEMINI_API_KEY = geminiKeyList[0] || '';
+let currentKeyIndex = 0;
 
-console.log(`[Perito Init] Gemini Key cargada: ${GEMINI_API_KEY ? 'SI (' + GEMINI_API_KEY.substring(0, 8) + '...)' : 'NO (Vacía)'}`);
+function getActiveKey() {
+  if (geminiKeyList.length === 0) return '';
+  return geminiKeyList[currentKeyIndex % geminiKeyList.length];
+}
 
-// 2. Configuración de Conexiones
+function rotateKey() {
+  if (geminiKeyList.length > 1) {
+    currentKeyIndex = (currentKeyIndex + 1) % geminiKeyList.length;
+    console.log(`[Perito] Rotando a la siguiente API Key (Índice: ${currentKeyIndex})`);
+  }
+}
+
+// 2. Conexiones
 const pool = new Pool({
   host: process.env.DB_HOST,
   port: Number(process.env.DB_PORT) || 5432,
@@ -26,50 +36,49 @@ const connection = new Redis({
   maxRetriesPerRequest: null,
 });
 
-// En perito/index.js (Función extraerDatosComprobante)
+// Función de Pausa para Throttling
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// 3. Extracción con Gemini IA
 async function extraerDatosComprobante(imageBase64, mimeType) {
-  try {
-    // Usar versión 3.5
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+  const activeKey = getActiveKey();
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${activeKey}`;
 
-    const prompt = `Analiza este comprobante de pago o transferencia y extrae estrictamente un objeto JSON con los siguientes campos:
+  const prompt = `Analiza este comprobante de pago o transferencia y extrae estrictamente un objeto JSON con los siguientes campos:
+  {
+    "monto": number o null,
+    "moneda": "USD" | "VES" | "EUR" | null,
+    "banco": string o null,
+    "referencia": string o null,
+    "titular": string o null
+  }`;
+
+  const response = await axios.post(
+    url,
     {
-      "monto": number o null,
-      "moneda": "USD" | "VES" | "EUR" | null,
-      "banco": string o null,
-      "referencia": string o null,
-      "titular": string o null
-    }`;
+      contents: [{
+        parts: [
+          { text: prompt },
+          { inline_data: { mime_type: mimeType || 'image/jpeg', data: imageBase64 } }
+        ]
+      }],
+      generationConfig: { response_mime_type: "application/json" }
+    },
+    { timeout: 30000 }
+  );
 
-    const response = await axios.post(
-      url,
-      {
-        contents: [{
-          parts: [
-            { text: prompt },
-            { inline_data: { mime_type: mimeType || 'image/jpeg', data: imageBase64 } }
-          ]
-        }],
-        generationConfig: { response_mime_type: "application/json" }
-      },
-      { timeout: 30000 }
-    );
-
-    const textResult = response.data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    return JSON.parse(textResult || '{}');
-  } catch (err) {
-    const detalle = err.response?.data?.error?.message || err.message;
-    console.error(`[Gemini API Error]`, detalle);
-    throw new Error(`API Gemini: ${detalle}`);
-  }
+  const textResult = response.data?.candidates?.[0]?.content?.parts?.[0]?.text;
+  return JSON.parse(textResult || '{}');
 }
 
-
-// 4. Worker BullMQ
+// 4. Worker con Rate Limiting
 const worker = new Worker('cola-analisis-ia', async (job) => {
   const { hash_imagen, imageBase64, mimeType, instancia } = job.data;
 
-  console.log(`[Perito Job] Analizando comprobante: ${hash_imagen} (Instancia: ${instancia})`);
+  // Pausa de 4 segundos para no saturar los 15 RPM de Gemini Free Tier
+  await sleep(7000);
+
+  console.log(`[Perito Job] Analizando: ${hash_imagen} (Instancia: ${instancia})`);
 
   try {
     const datos = await extraerDatosComprobante(imageBase64, mimeType);
@@ -100,26 +109,35 @@ const worker = new Worker('cola-analisis-ia', async (job) => {
       [hash_imagen]
     );
 
-    console.log(`[Perito OK] Extracción exitosa para ${hash_imagen}`);
+    console.log(`[Perito OK] Procesado: ${hash_imagen}`);
 
   } catch (err) {
-    console.error(`[Perito Error Final] Hash ${hash_imagen}:`, err.message);
+    const isRateLimit = err.response?.status === 429 || err.message?.includes('Quota exceeded');
 
-    await pool.query(
-      `UPDATE registros_raw SET estado = 'FALLO' WHERE hash_imagen = $1`,
-      [hash_imagen]
-    );
+    if (isRateLimit) {
+      rotateKey();
+      console.warn(`[Perito Quota Exceeded] Devolviendo ${hash_imagen} a PENDIENTE para reintento diferido.`);
+      
+      // En lugar de marcar FALLO, lo devuelve a PENDIENTE
+      await pool.query(
+        `UPDATE registros_raw SET estado = 'PENDIENTE' WHERE hash_imagen = $1`,
+        [hash_imagen]
+      );
+    } else {
+      console.error(`[Perito Error Fatal] ${hash_imagen}:`, err.message);
+      await pool.query(
+        `UPDATE registros_raw SET estado = 'FALLO' WHERE hash_imagen = $1`,
+        [hash_imagen]
+      );
+    }
     throw err;
   }
 }, {
   connection,
-  concurrency: 2
+  concurrency: 1 // Procesamiento estrictamente secuencial
 });
 
-worker.on('failed', (job, err) => {
-  console.error(`[Perito Job Failed] Tarea ${job?.data?.hash_imagen} falló:`, err.message);
-});
-
+worker.on('failed', (job, err) => console.error(`[Perito Job Failed] ID: ${job?.data?.hash_imagen}`));
 worker.on('error', (err) => console.error('[Perito Fatal Error]', err.message));
 
-console.log('[perito-worker] Escuchando la cola cola-analisis-ia en Redis...');
+console.log('[perito-worker] Escuchando la cola cola-analisis-ia con Throttling activo...');
