@@ -2,13 +2,15 @@ const { Worker } = require('bullmq');
 const Redis = require('ioredis');
 const { Pool } = require('pg');
 const axios = require('axios');
-// Captura GEMINI_KEYS desde .env, limpia comillas y toma la clave activa
+
+// 1. Captura de Variables y Clave de Gemini (.env)
 const rawKeys = process.env.GEMINI_KEYS || process.env.GEMINI_API_KEY || process.env.GEMINI_KEY || '';
 const geminiKeyList = rawKeys.split(',').map(k => k.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
 const GEMINI_API_KEY = geminiKeyList[0] || '';
 
 console.log(`[Perito Init] Gemini Key cargada: ${GEMINI_API_KEY ? 'SI (' + GEMINI_API_KEY.substring(0, 8) + '...)' : 'NO (Vacía)'}`);
-// 1. Configuración de Conexiones
+
+// 2. Configuración de Conexiones
 const pool = new Pool({
   host: process.env.DB_HOST,
   port: Number(process.env.DB_PORT) || 5432,
@@ -24,9 +26,7 @@ const connection = new Redis({
   maxRetriesPerRequest: null,
 });
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GEMINI_KEY || '';
-
-// 2. Función de Extracción con Gemini IA
+// 3. Función de Extracción con Gemini IA
 async function extraerDatosComprobante(imageBase64, mimeType) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
 
@@ -57,7 +57,7 @@ async function extraerDatosComprobante(imageBase64, mimeType) {
   return JSON.parse(textResult || '{}');
 }
 
-// 3. Worker Perito (Consumidor de la cola IA)
+// 4. Worker Perito (Consumidor de la cola IA)
 const worker = new Worker('cola-analisis-ia', async (job) => {
   const { hash_imagen, imageBase64, mimeType, instancia } = job.data;
 
