@@ -3,6 +3,7 @@ const { Queue } = require('bullmq');
 const Redis = require('ioredis');
 const axios = require('axios');
 
+// 1. Pool de PostgreSQL
 const pool = new Pool({
   host: process.env.DB_HOST,
   port: Number(process.env.DB_PORT) || 5432,
@@ -11,6 +12,7 @@ const pool = new Pool({
   database: process.env.DB_NAME,
 });
 
+// 2. Conexión Redis
 const connection = new Redis({
   host: process.env.REDIS_HOST,
   port: Number(process.env.REDIS_PORT) || 6379,
@@ -19,30 +21,28 @@ const connection = new Redis({
 });
 
 const colaIA = new Queue('cola-analisis-ia', { connection });
-
-// Flag para evitar solapamiento de ejecuciones
 let estaProcesando = false;
 
 async function extraerYEncolar() {
   if (estaProcesando) return;
-
   estaProcesando = true;
-  const client = await pool.connect();
 
   try {
-    // 1. Marcar como CADUCADO solo lo que tenga más de 24 horas en PENDIENTE
-    await client.query(`
+    // A. Caducar huérfanos 1X que superen las 24h sin recibir pareja
+    await pool.query(`
       UPDATE registros_raw
       SET estado = 'CADUCADO'
       WHERE timestamp_msg::bigint < (EXTRACT(EPOCH FROM NOW()) - 86400)
+        AND conteo = 1
         AND estado = 'PENDIENTE';
     `);
 
-    // 2. Leer registros PENDIENTES sin filtros restrictivos
-    const { rows: cola } = await client.query(`
-      SELECT hash_largo, url_imagen
+    // B. Seleccionar únicamente binomios 2X (conteo > 1) e incluir hash_imagen
+    const { rows: cola } = await pool.query(`
+      SELECT hash_largo, hash_imagen, url_imagen, instancia
       FROM registros_raw
       WHERE estado = 'PENDIENTE'
+        AND conteo > 1
         AND url_imagen IS NOT NULL 
         AND url_imagen LIKE 'http%'
       LIMIT 10;
@@ -50,11 +50,11 @@ async function extraerYEncolar() {
 
     if (cola.length === 0) return;
 
-    console.log(`[Lector API] Procesando ${cola.length} registro(s) pendientes...`);
+    console.log(`[Filtro] Procesando ${cola.length} binomio(s) 2X pendientes...`);
 
     for (const item of cola) {
       try {
-        // 3. Descargar imagen desde Cloudflare R2
+        // C. Descarga directa desde R2 (sin bloquear un cliente de la BD)
         const res = await axios.get(item.url_imagen, {
           responseType: 'arraybuffer',
           timeout: 5000
@@ -63,10 +63,12 @@ async function extraerYEncolar() {
         const imageBase64 = Buffer.from(res.data).toString('base64');
         const mimeType = res.headers['content-type'] || 'image/jpeg';
 
-        // 4. Publicar la tarea en Redis para el worker de Gemini
+        // D. Publicar en Redis propagando la huella hash_imagen para 'perito'
         await colaIA.add('analizar-comprobante', {
           hash_largo: item.hash_largo,
+          hash_imagen: item.hash_imagen,
           url_imagen: item.url_imagen,
+          instancia: item.instancia,
           imageBase64,
           mimeType
         }, {
@@ -74,25 +76,31 @@ async function extraerYEncolar() {
           removeOnFail: 100
         });
 
-        // 5. Marcar como EN_COLA para liberar el escáner
-        await client.query(`UPDATE registros_raw SET estado = 'EN_COLA' WHERE hash_largo = $1`, [item.hash_largo]);
-        console.log(`[Lector API OK] Encolado correctamente: ${item.hash_largo}`);
+        // E. Marcar como EN_COLA utilizando la huella binaria
+        await pool.query(
+          `UPDATE registros_raw SET estado = 'EN_COLA' WHERE hash_imagen = $1`,
+          [item.hash_imagen]
+        );
+
+        console.log(`[Filtro OK] Encolado exitoso para perito: ${item.hash_imagen}`);
 
       } catch (err) {
-        console.error(`[Lector API Error] Falló descarga de ${item.hash_largo}:`, err.message);
-        await client.query(`UPDATE registros_raw SET estado = 'FALLO' WHERE hash_largo = $1`, [item.hash_largo]);
+        console.error(`[Filtro Error] Falló descarga/encolado de ${item.hash_imagen}:`, err.message);
+        await pool.query(
+          `UPDATE registros_raw SET estado = 'FALLO' WHERE hash_imagen = $1`,
+          [item.hash_imagen]
+        );
       }
     }
 
   } catch (error) {
-    console.error('[Lector API Fatal Error]:', error.message);
+    console.error('[Filtro Fatal Error]:', error.message);
   } finally {
-    client.release();
     estaProcesando = false;
   }
 }
 
-// Ejecutar ciclo cada 5 segundos
+// Bucle de escaneo cada 5 segundos
 setInterval(extraerYEncolar, 5000);
 extraerYEncolar();
-console.log('[Lector API Service] Escaneando PostgreSQL y encolando en Redis...');
+console.log('[Filtro Service] Escaneando binomios 2X en PostgreSQL...');
