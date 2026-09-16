@@ -3,7 +3,7 @@ const Redis = require('ioredis');
 const { Pool } = require('pg');
 const axios = require('axios');
 
-// 1. Carga de Claves
+// 1. Carga y Rotación de Claves (.env)
 const rawKeys = process.env.GEMINI_KEYS || process.env.GEMINI_API_KEY || process.env.GEMINI_KEY || '';
 const geminiKeyList = rawKeys.split(',').map(k => k.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
 let currentKeyIndex = 0;
@@ -16,7 +16,7 @@ function getActiveKey() {
 function rotateKey() {
   if (geminiKeyList.length > 1) {
     currentKeyIndex = (currentKeyIndex + 1) % geminiKeyList.length;
-    console.log(`[Perito] Rotando a la siguiente API Key (Índice: ${currentKeyIndex})`);
+    console.log(`[Perito] Rotando a API Key índice: ${currentKeyIndex}`);
   }
 }
 
@@ -36,7 +36,6 @@ const connection = new Redis({
   maxRetriesPerRequest: null,
 });
 
-// Función de Pausa para Throttling
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // 3. Extracción con Gemini IA
@@ -71,12 +70,12 @@ async function extraerDatosComprobante(imageBase64, mimeType) {
   return JSON.parse(textResult || '{}');
 }
 
-// 4. Worker con Rate Limiting
+// 4. Worker con Resiliencia ante Errores 503 / 429
 const worker = new Worker('cola-analisis-ia', async (job) => {
   const { hash_imagen, imageBase64, mimeType, instancia } = job.data;
 
-  // Pausa de 4 segundos para no saturar los 15 RPM de Gemini Free Tier
-  await sleep(15000);
+  // Pausa preventiva de 12s para cumplir cuota de API
+  await sleep(12000);
 
   console.log(`[Perito Job] Analizando: ${hash_imagen} (Instancia: ${instancia})`);
 
@@ -109,20 +108,32 @@ const worker = new Worker('cola-analisis-ia', async (job) => {
       [hash_imagen]
     );
 
-    console.log(`[Perito OK] Procesado: ${hash_imagen}`);
+    console.log(`[Perito OK] Procesado exitoso: ${hash_imagen}`);
 
   } catch (err) {
-    const isRateLimit = err.response?.status === 429 || err.message?.includes('Quota exceeded');
+    const status = err.response?.status;
+    const errText = (err.response?.data?.error?.message || err.message || '').toLowerCase();
+    
+    // Identificar si es un error temporal (429 Cuota, 503/500 Servidor ocupado o Timeout)
+    const isTransientError = status === 429 || 
+                             status >= 500 || 
+                             errText.includes('quota') || 
+                             errText.includes('exceeded') || 
+                             errText.includes('rate') ||
+                             err.code === 'ECONNRESET' ||
+                             err.code === 'ETIMEDOUT';
 
-    if (isRateLimit) {
+    if (isTransientError) {
       rotateKey();
-      console.warn(`[Perito Quota Exceeded] Devolviendo ${hash_imagen} a PENDIENTE para reintento diferido.`);
+      console.warn(`[Perito Falla Temporal HTTP ${status || err.code}] Reintentando ${hash_imagen} (vuelve a PENDIENTE).`);
       
-      // En lugar de marcar FALLO, lo devuelve a PENDIENTE
       await pool.query(
         `UPDATE registros_raw SET estado = 'PENDIENTE' WHERE hash_imagen = $1`,
         [hash_imagen]
       );
+      
+      // Pausa de enfriamiento adicional tras error 503 / 429
+      await sleep(15000);
     } else {
       console.error(`[Perito Error Fatal] ${hash_imagen}:`, err.message);
       await pool.query(
@@ -130,14 +141,13 @@ const worker = new Worker('cola-analisis-ia', async (job) => {
         [hash_imagen]
       );
     }
-    throw err;
   }
 }, {
   connection,
-  concurrency: 1 // Procesamiento estrictamente secuencial
+  concurrency: 1
 });
 
 worker.on('failed', (job, err) => console.error(`[Perito Job Failed] ID: ${job?.data?.hash_imagen}`));
 worker.on('error', (err) => console.error('[Perito Fatal Error]', err.message));
 
-console.log('[perito-worker] Escuchando la cola cola-analisis-ia con Throttling activo...');
+console.log('[perito-worker] Escuchando cola-analisis-ia con control de fallos 503/429...');
