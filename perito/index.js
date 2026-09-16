@@ -3,7 +3,7 @@ const Redis = require('ioredis');
 const { Pool } = require('pg');
 const axios = require('axios');
 const FormData = require('form-data');
-const crypto = require('crypto'); // Generador de huella binaria única
+const crypto = require('crypto');
 
 // 1. Configuración de Variables Globales
 const RAW_EVO_URL = process.env.EVOLUTION_URL || 'https://evo.jairokov.com';
@@ -22,7 +22,7 @@ console.log(`[Worker Init] APIKey detectada: ${EVOLUTION_APIKEY ? 'SI (Cargada)'
 // 2. Conexión a PostgreSQL
 const pool = new Pool({
   host: process.env.DB_HOST,
-  port: process.env.DB_PORT || 5432,
+  port: Number(process.env.DB_PORT) || 5432,
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
@@ -31,12 +31,12 @@ const pool = new Pool({
 // 3. Conexión a Redis
 const connection = new Redis({
   host: process.env.REDIS_HOST,
-  port: process.env.REDIS_PORT || 6379,
+  port: Number(process.env.REDIS_PORT) || 6379,
   password: process.env.REDIS_PASSWORD || undefined,
   maxRetriesPerRequest: null,
 });
 
-// 4. Worker Procesador
+// 4. Worker Procesador (Buzón / Escritor)
 const worker = new Worker('cola-escritor-atom', async (job) => {
   const {
     hash_corto, hash_largo, grupo_raw, usuario_raw,
@@ -44,7 +44,7 @@ const worker = new Worker('cola-escritor-atom', async (job) => {
   } = job.data;
 
   let urlR2 = null;
-  let hash_imagen = hash_largo; // Fallback por si no trae imagen
+  let hash_imagen = hash_largo; // Fallback para mensajes sin imagen
 
   // Procesamiento de Imagen (si aplica)
   if (es_imagen) {
@@ -74,7 +74,7 @@ const worker = new Worker('cola-escritor-atom', async (job) => {
       if (typeof base64Data === 'string' && base64Data.length > 0) {
         const bufferImagen = Buffer.from(base64Data, 'base64');
         
-        // Huella única basada en el contenido binario real de la foto
+        // Huella única basada en el binario real de la foto (MD5)
         hash_imagen = crypto.createHash('md5').update(bufferImagen).digest('hex');
 
         const form = new FormData();
@@ -100,12 +100,13 @@ const worker = new Worker('cola-escritor-atom', async (job) => {
   }
 
   // 5. Inserción / Actualización en PostgreSQL (UPSERT por hash_imagen)
+  // Estado se mantiene en 'PENDIENTE' para que 'filtro' pueda escanear binomios 2X
   const queryUpsert = `
     INSERT INTO registros_raw (
       hash_corto, hash_largo, grupo_raw, usuario_raw, nombre_push,
       caption, timestamp_msg, url_imagen, conteo, estado, instancia, hash_imagen
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, 'PROCESADO', $9, $10)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, 'PENDIENTE', $9, $10)
     ON CONFLICT (hash_imagen) DO UPDATE SET
       conteo = registros_raw.conteo + 1,
       grupo_raw_2 = CASE WHEN registros_raw.grupo_raw <> EXCLUDED.grupo_raw THEN EXCLUDED.grupo_raw ELSE registros_raw.grupo_raw_2 END,
@@ -113,7 +114,7 @@ const worker = new Worker('cola-escritor-atom', async (job) => {
       url_imagen = COALESCE(EXCLUDED.url_imagen, registros_raw.url_imagen),
       timestamp_msg = EXCLUDED.timestamp_msg,
       instancia = COALESCE(EXCLUDED.instancia, registros_raw.instancia),
-      estado = 'PROCESADO'
+      estado = 'PENDIENTE'
     RETURNING (xmax = 0) AS es_nuevo, hash_corto, conteo;
   `;
 
@@ -129,9 +130,10 @@ const worker = new Worker('cola-escritor-atom', async (job) => {
     instance || 'default',
     hash_imagen
   ];
+
   const result = await pool.query(queryUpsert, values);
 
-  console.log(`[Worker DB OK] Procesado: ${hash_corto} | Conteo: ${result.rows[0].conteo} | Es nuevo: ${result.rows[0].es_nuevo}`);
+  console.log(`[Buzón OK] Ingesta: ${hash_corto} | Conteo: ${result.rows[0].conteo} | Es nuevo: ${result.rows[0].es_nuevo}`);
   return result.rows[0];
 }, { connection });
 
