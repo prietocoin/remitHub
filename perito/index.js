@@ -2,7 +2,12 @@ const { Worker } = require('bullmq');
 const Redis = require('ioredis');
 const { Pool } = require('pg');
 const axios = require('axios');
+// Captura GEMINI_KEYS desde .env, limpia comillas y toma la clave activa
+const rawKeys = process.env.GEMINI_KEYS || process.env.GEMINI_API_KEY || process.env.GEMINI_KEY || '';
+const geminiKeyList = rawKeys.split(',').map(k => k.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
+const GEMINI_API_KEY = geminiKeyList[0] || '';
 
+console.log(`[Perito Init] Gemini Key cargada: ${GEMINI_API_KEY ? 'SI (' + GEMINI_API_KEY.substring(0, 8) + '...)' : 'NO (Vacía)'}`);
 // 1. Configuración de Conexiones
 const pool = new Pool({
   host: process.env.DB_HOST,
