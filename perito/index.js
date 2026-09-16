@@ -26,10 +26,11 @@ const connection = new Redis({
   maxRetriesPerRequest: null,
 });
 
-// 3. Función de Extracción con Gemini IA
+// En perito/index.js (Función extraerDatosComprobante)
 async function extraerDatosComprobante(imageBase64, mimeType) {
   try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+    // Usar versión 3.5
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${GEMINI_API_KEY}`;
 
     const prompt = `Analiza este comprobante de pago o transferencia y extrae estrictamente un objeto JSON con los siguientes campos:
     {
@@ -62,6 +63,7 @@ async function extraerDatosComprobante(imageBase64, mimeType) {
     throw new Error(`API Gemini: ${detalle}`);
   }
 }
+
 
 // 4. Worker BullMQ
 const worker = new Worker('cola-analisis-ia', async (job) => {
