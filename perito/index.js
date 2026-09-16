@@ -3,7 +3,7 @@ const Redis = require('ioredis');
 const { Pool } = require('pg');
 const axios = require('axios');
 
-// 1. Captura de Variables y Clave de Gemini (.env)
+// 1. Lectura de variables de entorno y API Key de Gemini
 const rawKeys = process.env.GEMINI_KEYS || process.env.GEMINI_API_KEY || process.env.GEMINI_KEY || '';
 const geminiKeyList = rawKeys.split(',').map(k => k.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
 const GEMINI_API_KEY = geminiKeyList[0] || '';
@@ -19,18 +19,6 @@ const pool = new Pool({
   database: process.env.DB_NAME,
 });
 
-// En el bloque catch de worker en perito/index.js
-} catch (err) {
-  const detalle = err.response?.data?.error?.message || err.response?.data || err.message;
-  console.error(`[Perito Error DETALLE] ${hash_imagen}:`, detalle);
-
-  await pool.query(
-    `UPDATE registros_raw SET estado = 'FALLO' WHERE hash_imagen = $1`,
-    [hash_imagen]
-  );
-  throw err;
-}
-
 const connection = new Redis({
   host: process.env.REDIS_HOST,
   port: Number(process.env.REDIS_PORT) || 6379,
@@ -40,46 +28,50 @@ const connection = new Redis({
 
 // 3. Función de Extracción con Gemini IA
 async function extraerDatosComprobante(imageBase64, mimeType) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
 
-  const prompt = `Analiza este comprobante de pago o transferencia y extrae estrictamente un objeto JSON con los siguientes campos:
-  {
-    "monto": number o null,
-    "moneda": "USD" | "VES" | "EUR" | null,
-    "banco": string o null,
-    "referencia": string o null,
-    "titular": string o null
-  }`;
-
-  const response = await axios.post(
-    url,
+    const prompt = `Analiza este comprobante de pago o transferencia y extrae estrictamente un objeto JSON con los siguientes campos:
     {
-      contents: [{
-        parts: [
-          { text: prompt },
-          { inline_data: { mime_type: mimeType || 'image/jpeg', data: imageBase64 } }
-        ]
-      }],
-      generationConfig: { response_mime_type: "application/json" }
-    },
-    { timeout: 30000 }
-  );
+      "monto": number o null,
+      "moneda": "USD" | "VES" | "EUR" | null,
+      "banco": string o null,
+      "referencia": string o null,
+      "titular": string o null
+    }`;
 
-  const textResult = response.data?.candidates?.[0]?.content?.parts?.[0]?.text;
-  return JSON.parse(textResult || '{}');
+    const response = await axios.post(
+      url,
+      {
+        contents: [{
+          parts: [
+            { text: prompt },
+            { inline_data: { mime_type: mimeType || 'image/jpeg', data: imageBase64 } }
+          ]
+        }],
+        generationConfig: { response_mime_type: "application/json" }
+      },
+      { timeout: 30000 }
+    );
+
+    const textResult = response.data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    return JSON.parse(textResult || '{}');
+  } catch (err) {
+    const detalle = err.response?.data?.error?.message || err.message;
+    console.error(`[Gemini API Error]`, detalle);
+    throw new Error(`API Gemini: ${detalle}`);
+  }
 }
 
-// 4. Worker Perito (Consumidor de la cola IA)
+// 4. Worker BullMQ
 const worker = new Worker('cola-analisis-ia', async (job) => {
   const { hash_imagen, imageBase64, mimeType, instancia } = job.data;
 
-  console.log(`[Perito Job] Analizando comprobante para hash_imagen: ${hash_imagen} (Instancia: ${instancia})`);
+  console.log(`[Perito Job] Analizando comprobante: ${hash_imagen} (Instancia: ${instancia})`);
 
   try {
-    // A. Extracción con Gemini IA
     const datos = await extraerDatosComprobante(imageBase64, mimeType);
 
-    // B. Insertar / Actualizar en comprobantes_raw usando hash_imagen como clave
     await pool.query(`
       INSERT INTO comprobantes_raw (
         hash_largo, monto, moneda, banco, referencia, titular, procesado_ia
@@ -101,18 +93,16 @@ const worker = new Worker('cola-analisis-ia', async (job) => {
       datos.titular || null
     ]);
 
-    // C. Cierre de Estado: Marcar registros_raw como 'PROCESADO'
     await pool.query(
       `UPDATE registros_raw SET estado = 'PROCESADO' WHERE hash_imagen = $1`,
       [hash_imagen]
     );
 
-    console.log(`[Perito OK] Extracción exitosa e insertada en comprobantes_raw: ${hash_imagen}`);
+    console.log(`[Perito OK] Extracción exitosa para ${hash_imagen}`);
 
   } catch (err) {
-    console.error(`[Perito Error] Falló el análisis para ${hash_imagen}:`, err.message);
+    console.error(`[Perito Error Final] Hash ${hash_imagen}:`, err.message);
 
-    // D. Marcar como FALLO para evitar bloqueos continuos en 'EN_COLA'
     await pool.query(
       `UPDATE registros_raw SET estado = 'FALLO' WHERE hash_imagen = $1`,
       [hash_imagen]
@@ -128,8 +118,6 @@ worker.on('failed', (job, err) => {
   console.error(`[Perito Job Failed] Tarea ${job?.data?.hash_imagen} falló:`, err.message);
 });
 
-worker.on('error', (err) => {
-  console.error('[Perito Fatal Error]', err.message);
-});
+worker.on('error', (err) => console.error('[Perito Fatal Error]', err.message));
 
 console.log('[perito-worker] Escuchando la cola cola-analisis-ia en Redis...');
