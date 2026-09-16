@@ -76,7 +76,7 @@ const worker = new Worker('cola-analisis-ia', async (job) => {
   const { hash_imagen, imageBase64, mimeType, instancia } = job.data;
 
   // Pausa de 4 segundos para no saturar los 15 RPM de Gemini Free Tier
-  await sleep(7000);
+  await sleep(15000);
 
   console.log(`[Perito Job] Analizando: ${hash_imagen} (Instancia: ${instancia})`);
 
