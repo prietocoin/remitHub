@@ -56,9 +56,9 @@ async function extraerYEncolar() {
       try {
         // C. Descarga directa desde R2 (sin bloquear un cliente de la BD)
         const res = await axios.get(item.url_imagen, {
-          responseType: 'arraybuffer',
-          timeout: 5000
-        });
+  responseType: 'arraybuffer',
+  timeout: 15000 // Elevado de 5,000ms a 15,000ms
+});
 
         const imageBase64 = Buffer.from(res.data).toString('base64');
         const mimeType = res.headers['content-type'] || 'image/jpeg';
