@@ -2,24 +2,8 @@ const { Worker } = require('bullmq');
 const Redis = require('ioredis');
 const { Pool } = require('pg');
 const axios = require('axios');
-const FormData = require('form-data');
-const crypto = require('crypto');
 
-// 1. Configuración de Variables Globales
-const RAW_EVO_URL = process.env.EVOLUTION_URL || 'https://evo.jairokov.com';
-const EVOLUTION_URL = RAW_EVO_URL.replace(/\/$/, '');
-
-const EVOLUTION_APIKEY = 
-  process.env.EVOLUTION_APIKEY || 
-  process.env.EVOLUTION_API_KEY || 
-  process.env.API_KEY || 
-  process.env.AUTHENTICATION_API_KEY || 
-  '';
-
-console.log(`[Worker Init] Target URL: ${EVOLUTION_URL}`);
-console.log(`[Worker Init] APIKey detectada: ${EVOLUTION_APIKEY ? 'SI (Cargada)' : 'NO (Vacía)'}`);
-
-// 2. Conexión a PostgreSQL
+// 1. Configuración de Conexiones
 const pool = new Pool({
   host: process.env.DB_HOST,
   port: Number(process.env.DB_PORT) || 5432,
@@ -28,7 +12,6 @@ const pool = new Pool({
   database: process.env.DB_NAME,
 });
 
-// 3. Conexión a Redis
 const connection = new Redis({
   host: process.env.REDIS_HOST,
   port: Number(process.env.REDIS_PORT) || 6379,
@@ -36,114 +19,100 @@ const connection = new Redis({
   maxRetriesPerRequest: null,
 });
 
-// 4. Worker Procesador (Buzón / Escritor)
-const worker = new Worker('cola-escritor-atom', async (job) => {
-  const {
-    hash_corto, hash_largo, grupo_raw, usuario_raw,
-    nombre_push, caption, timestamp_msg, es_imagen, instance
-  } = job.data;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GEMINI_KEY || '';
 
-  let urlR2 = null;
-  let hash_imagen = hash_largo; // Fallback para mensajes sin imagen
+// 2. Función de Extracción con Gemini IA
+async function extraerDatosComprobante(imageBase64, mimeType) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
 
-  // Procesamiento de Imagen (si aplica)
-  if (es_imagen) {
-    try {
-      const targetInstance = (instance || 'default').trim();
-      const endpoint = `${EVOLUTION_URL}/chat/getBase64FromMediaMessage/${targetInstance}`;
+  const prompt = `Analiza este comprobante de pago o transferencia y extrae estrictamente un objeto JSON con los siguientes campos:
+  {
+    "monto": number o null,
+    "moneda": "USD" | "VES" | "EUR" | null,
+    "banco": string o null,
+    "referencia": string o null,
+    "titular": string o null
+  }`;
 
-      console.log(`[Worker Media] Solicitando imagen para ${hash_corto} (Instancia: ${targetInstance})`);
+  const response = await axios.post(
+    url,
+    {
+      contents: [{
+        parts: [
+          { text: prompt },
+          { inline_data: { mime_type: mimeType || 'image/jpeg', data: imageBase64 } }
+        ]
+      }],
+      generationConfig: { response_mime_type: "application/json" }
+    },
+    { timeout: 30000 }
+  );
 
-      const resMedia = await axios.post(
-        endpoint,
-        {
-          message: { key: { id: hash_largo } },
-          convertToMp4: false
-        },
-        {
-          headers: {
-            'apikey': EVOLUTION_APIKEY,
-            'apiKey': EVOLUTION_APIKEY
-          },
-          timeout: 15000
-        }
-      );
+  const textResult = response.data?.candidates?.[0]?.content?.parts?.[0]?.text;
+  return JSON.parse(textResult || '{}');
+}
 
-      const base64Data = resMedia.data?.base64 || resMedia.data?.mediaBase64;
+// 3. Worker Perito (Consumidor de la cola IA)
+const worker = new Worker('cola-analisis-ia', async (job) => {
+  const { hash_imagen, imageBase64, mimeType, instancia } = job.data;
 
-      if (typeof base64Data === 'string' && base64Data.length > 0) {
-        const bufferImagen = Buffer.from(base64Data, 'base64');
-        
-        // Huella única basada en el binario real de la foto (MD5)
-        hash_imagen = crypto.createHash('md5').update(bufferImagen).digest('hex');
+  console.log(`[Perito Job] Analizando comprobante para hash_imagen: ${hash_imagen} (Instancia: ${instancia})`);
 
-        const form = new FormData();
-        form.append('file', bufferImagen, `${hash_corto}.jpg`);
+  try {
+    // A. Extracción con Gemini IA
+    const datos = await extraerDatosComprobante(imageBase64, mimeType);
 
-        await axios.post('https://api.jairokov.com/upload', form, {
-          headers: { ...form.getHeaders() },
-          timeout: 15000
-        });
+    // B. Insertar / Actualizar en comprobantes_raw usando hash_imagen como clave
+    await pool.query(`
+      INSERT INTO comprobantes_raw (
+        hash_largo, monto, moneda, banco, referencia, titular, procesado_ia
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, true)
+      ON CONFLICT (hash_largo) DO UPDATE SET
+        monto = EXCLUDED.monto,
+        moneda = EXCLUDED.moneda,
+        banco = EXCLUDED.banco,
+        referencia = EXCLUDED.referencia,
+        titular = EXCLUDED.titular,
+        procesado_ia = true;
+    `, [
+      hash_imagen,
+      datos.monto || null,
+      datos.moneda || null,
+      datos.banco || null,
+      datos.referencia || null,
+      datos.titular || null
+    ]);
 
-        urlR2 = `https://pub-49b9c87f6e6a418ba42de5ba36ddc73e.r2.dev/${hash_corto}.jpg`;
-        console.log(`[Worker Media OK] Subida a R2 exitosa: ${urlR2}`);
-      } else {
-        console.warn(`[Worker Media Warning] Base64 vacío o inválido para ${hash_corto}`);
-      }
-    } catch (err) {
-      console.error(`[Worker Media Error ${hash_corto}]`, {
-        status: err.response?.status,
-        detalle: err.response?.data || err.message,
-        url_intentada: err.config?.url
-      });
-    }
+    // C. Cierre de Estado: Marcar registros_raw como 'PROCESADO'
+    await pool.query(
+      `UPDATE registros_raw SET estado = 'PROCESADO' WHERE hash_imagen = $1`,
+      [hash_imagen]
+    );
+
+    console.log(`[Perito OK] Extracción exitosa e insertada en comprobantes_raw: ${hash_imagen}`);
+
+  } catch (err) {
+    console.error(`[Perito Error] Falló el análisis para ${hash_imagen}:`, err.message);
+
+    // D. Marcar como FALLO para evitar bloqueos continuos en 'EN_COLA'
+    await pool.query(
+      `UPDATE registros_raw SET estado = 'FALLO' WHERE hash_imagen = $1`,
+      [hash_imagen]
+    );
+    throw err;
   }
+}, {
+  connection,
+  concurrency: 2
+});
 
-  // 5. Inserción / Actualización en PostgreSQL (UPSERT por hash_imagen)
-  // Estado se mantiene en 'PENDIENTE' para que 'filtro' pueda escanear binomios 2X
-  const queryUpsert = `
-    INSERT INTO registros_raw (
-      hash_corto, hash_largo, grupo_raw, usuario_raw, nombre_push,
-      caption, timestamp_msg, url_imagen, conteo, estado, instancia, hash_imagen
-    )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, 'PENDIENTE', $9, $10)
-    ON CONFLICT (hash_imagen) DO UPDATE SET
-      conteo = registros_raw.conteo + 1,
-      grupo_raw_2 = CASE WHEN registros_raw.grupo_raw <> EXCLUDED.grupo_raw THEN EXCLUDED.grupo_raw ELSE registros_raw.grupo_raw_2 END,
-      usuario_raw_2 = CASE WHEN registros_raw.usuario_raw <> EXCLUDED.usuario_raw THEN EXCLUDED.usuario_raw ELSE registros_raw.usuario_raw_2 END,
-      url_imagen = COALESCE(EXCLUDED.url_imagen, registros_raw.url_imagen),
-      timestamp_msg = EXCLUDED.timestamp_msg,
-      instancia = COALESCE(EXCLUDED.instancia, registros_raw.instancia),
-      estado = 'PENDIENTE'
-    RETURNING (xmax = 0) AS es_nuevo, hash_corto, conteo;
-  `;
-
-  const values = [
-    hash_corto, 
-    hash_largo, 
-    grupo_raw, 
-    usuario_raw, 
-    nombre_push, 
-    caption, 
-    timestamp_msg, 
-    urlR2, 
-    instance || 'default',
-    hash_imagen
-  ];
-
-  const result = await pool.query(queryUpsert, values);
-
-  console.log(`[Buzón OK] Ingesta: ${hash_corto} | Conteo: ${result.rows[0].conteo} | Es nuevo: ${result.rows[0].es_nuevo}`);
-  return result.rows[0];
-}, { connection });
-
-// 6. Manejo de Errores Globales
 worker.on('failed', (job, err) => {
-  console.error(`[Worker Job Error] Tarea ${job?.data?.hash_corto} falló:`, err.message);
+  console.error(`[Perito Job Failed] Tarea ${job?.data?.hash_imagen} falló:`, err.message);
 });
 
 worker.on('error', (err) => {
-  console.error('[Worker Fatal Error]', err.message);
+  console.error('[Perito Fatal Error]', err.message);
 });
 
-console.log('[escritor-worker] Escuchando la cola de Redis...');
+console.log('[perito-worker] Escuchando la cola cola-analisis-ia en Redis...');
