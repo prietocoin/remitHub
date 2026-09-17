@@ -35,24 +35,8 @@ function parsearJSONSeguro(texto) {
   }
 }
 
-// Descarga la imagen con hasta 3 reintentos antes de desistir
-async function descargarImagenConReintento(url) {
-  for (let i = 1; i <= 3; i++) {
-    try {
-      const res = await axios.get(url, { responseType: 'arraybuffer', timeout: 20000 });
-      return {
-        base64: Buffer.from(res.data).toString('base64'),
-        mimeType: res.headers['content-type'] || 'image/jpeg'
-      };
-    } catch (err) {
-      if (i === 3) throw err;
-      await sleep(3000);
-    }
-  }
-}
-
 async function procesarDirecto() {
-  console.log('[Perito Directo] Modo 1 a 1 Secuencial Activado.');
+  console.log('[Perito Directo] Escuchando PostgreSQL con diagnóstico estricto...');
 
   while (true) {
     let item = null;
@@ -65,9 +49,7 @@ async function procesarDirecto() {
         LIMIT 1;
       `);
 
-      if (res.rows.length > 0) {
-        item = res.rows[0];
-      }
+      if (res.rows.length > 0) item = res.rows[0];
     } catch (err) {
       console.error('[Error Consulta DB]', err.message);
     }
@@ -77,15 +59,30 @@ async function procesarDirecto() {
       continue;
     }
 
-    console.log(`[Inicio Procesamiento 1 a 1] Hash: ${item.hash_imagen}`);
+    console.log(`[Procesando] Hash: ${item.hash_imagen}`);
 
+    // PASO 1: Descargar imagen (Única fase que puede marcar FALLO)
+    let imageBase64, mimeType;
     try {
-      if (!item.url_imagen) throw new Error('Registro sin URL de imagen');
+      if (!item.url_imagen) throw { isImageError: true, message: 'URL nula o vacía' };
 
-      // 1. Descargar imagen con reintentos
-      const { base64, mimeType } = await descargarImagenConReintento(item.url_imagen);
+      const imgRes = await axios.get(item.url_imagen, { responseType: 'arraybuffer', timeout: 20000 });
+      imageBase64 = Buffer.from(imgRes.data).toString('base64');
+      mimeType = imgRes.headers['content-type'] || 'image/jpeg';
+    } catch (imgErr) {
+      const imgStatus = imgErr.response?.status;
+      console.error(`[Error Descarga Imagen] Hash ${item.hash_imagen}: HTTP ${imgStatus || 'RED'} - ${imgErr.message}`);
 
-      // 2. Extracción con Gemini 3.5 Flash
+      // Solo si la imagen NO EXISTE en Cloudflare R2 se marca como FALLO
+      if (imgStatus === 404 || imgStatus === 410 || imgErr.isImageError) {
+        await pool.query(`UPDATE registros_raw SET estado = 'FALLO' WHERE hash_imagen = $1`, [item.hash_imagen]);
+      }
+      await sleep(5000);
+      continue; // Salta al siguiente ciclo sin tocar Gemini
+    }
+
+    // PASO 2: Consulta IA y Guardado en DB (NUNCA marca FALLO el registro)
+    try {
       const activeKey = getActiveKey();
       const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${activeKey}`;
       const prompt = `Analiza este comprobante de pago o transferencia y extrae estrictamente un objeto JSON:
@@ -103,7 +100,7 @@ async function procesarDirecto() {
           contents: [{
             parts: [
               { text: prompt },
-              { inline_data: { mime_type: mimeType, data: base64 } }
+              { inline_data: { mime_type: mimeType, data: imageBase64 } }
             ]
           }],
           generationConfig: { response_mime_type: "application/json" }
@@ -114,7 +111,6 @@ async function procesarDirecto() {
       const textResult = aiResponse.data?.candidates?.[0]?.content?.parts?.[0]?.text;
       const datos = parsearJSONSeguro(textResult);
 
-      // 3. Guardar en comprobantes_raw
       await pool.query(`
         INSERT INTO comprobantes_raw (
           hash_largo, monto, moneda, banco, referencia, titular, procesado_ia
@@ -136,33 +132,17 @@ async function procesarDirecto() {
         datos.titular || null
       ]);
 
-      // 4. Marcar como PROCESADO
-      await pool.query(
-        `UPDATE registros_raw SET estado = 'PROCESADO' WHERE hash_imagen = $1`,
-        [item.hash_imagen]
-      );
+      await pool.query(`UPDATE registros_raw SET estado = 'PROCESADO' WHERE hash_imagen = $1`, [item.hash_imagen]);
+      console.log(`[ÉXITO] ${item.hash_imagen}`);
 
-      console.log(`[ÉXITO] Procesado e Insertado: ${item.hash_imagen}`);
-
-    } catch (err) {
-      const status = err.response?.status;
-      const msg = err.response?.data?.error?.message || err.message;
-
-      // Errores temporales de API o red: NO cambian a FALLO, reintentan en el siguiente ciclo
-      if (status === 429 || status >= 500 || err.code === 'ETIMEDOUT' || err.code === 'ECONNRESET') {
-        rotateKey();
-        console.warn(`[Reintento Temporal - ${status || err.code}] ${msg}. Permanece en cola.`);
-      } else {
-        // Solo falla si la URL no existe (404) o el archivo está corrupto tras reintentos
-        console.error(`[Fallo Incurable] Hash ${item.hash_imagen}: ${msg}`);
-        await pool.query(
-          `UPDATE registros_raw SET estado = 'FALLO' WHERE hash_imagen = $1`,
-          [item.hash_imagen]
-        );
-      }
+    } catch (apiErr) {
+      rotateKey();
+      const status = apiErr.response?.status;
+      const detail = apiErr.response?.data?.error?.message || apiErr.message;
+      console.error(`[Error Sistema/API - HTTP ${status || 'DB/Internal'}] ${detail}`);
+      // Se mantiene en PENDIENTE para reintentar en el próximo ciclo
     }
 
-    // Pausa garantizada de 15 segundos para procesamiento 1 a 1 sin saturación
     await sleep(15000);
   }
 }
