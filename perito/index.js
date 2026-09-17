@@ -36,13 +36,14 @@ function parsearJSONSeguro(texto) {
 }
 
 async function procesarDirecto() {
-  console.log('[Perito Directo] Iniciado en modo 1 a 1 estricto (Pausa de 20s)...');
+  const pid = process.pid;
+  console.log(`[Perito Directo PID:${pid}] Iniciado en modo estricto de 20s...`);
 
   while (true) {
     let item = null;
 
     try {
-      // Bloqueo de fila para prevenir lecturas duplicadas
+      // 1. Obtener 1 solo registro bloqueando la fila
       const res = await pool.query(`
         SELECT hash_imagen, url_imagen, instancia
         FROM registros_raw
@@ -53,26 +54,31 @@ async function procesarDirecto() {
 
       if (res.rows.length > 0) item = res.rows[0];
     } catch (err) {
-      console.error('[Error DB]', err.message);
+      console.error(`[PID:${pid} Error DB Query]`, err.message);
     }
 
+    // Si no hay registros, esperar 5s y reintentar
     if (!item) {
       await sleep(5000);
       continue;
     }
 
-    const horaInicio = new Date().toLocaleTimeString();
-    console.log(`[${horaInicio}] [Inicio] Hash: ${item.hash_imagen}`);
-
+    // Estructura principal con FINALLY garantizado
     try {
-      if (!item.url_imagen) throw { isImageError: true, message: 'URL nula' };
+      const hora = new Date().toLocaleTimeString();
+      console.log(`[${hora}] [PID:${pid}] [INICIO] Hash: ${item.hash_imagen}`);
 
-      // 1. Descarga de imagen
+      if (!item.url_imagen) {
+        await pool.query(`UPDATE registros_raw SET estado = 'FALLO' WHERE hash_imagen = $1`, [item.hash_imagen]);
+        throw new Error('URL nula');
+      }
+
+      // Descargar imagen
       const imgRes = await axios.get(item.url_imagen, { responseType: 'arraybuffer', timeout: 20000 });
       const imageBase64 = Buffer.from(imgRes.data).toString('base64');
       const mimeType = imgRes.headers['content-type'] || 'image/jpeg';
 
-      // 2. Consulta a Gemini IA
+      // Consultar Gemini IA
       const activeKey = getActiveKey();
       const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${activeKey}`;
       const prompt = `Analiza este comprobante de pago o transferencia y extrae estrictamente un objeto JSON:
@@ -101,7 +107,7 @@ async function procesarDirecto() {
       const textResult = aiResponse.data?.candidates?.[0]?.content?.parts?.[0]?.text;
       const datos = parsearJSONSeguro(textResult);
 
-      // 3. Guardar en BD
+      // Guardar en BD
       await pool.query(`
         INSERT INTO comprobantes_raw (
           hash_largo, monto, moneda, banco, referencia, titular, procesado_ia
@@ -124,26 +130,24 @@ async function procesarDirecto() {
       ]);
 
       await pool.query(`UPDATE registros_raw SET estado = 'PROCESADO' WHERE hash_imagen = $1`, [item.hash_imagen]);
-      
-      const horaFin = new Date().toLocaleTimeString();
-      console.log(`[${horaFin}] [ÉXITO] Completado: ${item.hash_imagen}`);
+      console.log(`[${new Date().toLocaleTimeString()}] [PID:${pid}] [ÉXITO] ${item.hash_imagen}`);
 
     } catch (err) {
       const status = err.response?.status;
       const msg = err.response?.data?.error?.message || err.message;
 
-      if (status === 404 || status === 410 || err.isImageError) {
-        console.error(`[Imagen no disponible/404] Hash ${item.hash_imagen}`);
+      if (status === 404 || status === 410) {
+        console.error(`[PID:${pid} Imagen 404] Hash ${item.hash_imagen}`);
         await pool.query(`UPDATE registros_raw SET estado = 'FALLO' WHERE hash_imagen = $1`, [item.hash_imagen]);
       } else {
         rotateKey();
-        console.warn(`[Reintento Red/API HTTP ${status || 'Error'}] ${msg}`);
+        console.warn(`[PID:${pid} Reintento Red/API] ${msg}`);
       }
+    } finally {
+      // ESTA PAUSA SE EJECUTA SIEMPRE (ÉXITO O ERROR)
+      console.log(`[${new Date().toLocaleTimeString()}] [PID:${pid}] Pausa obligatoria de 20s...`);
+      await sleep(20000);
     }
-
-    // PAUSA OBLIGATORIA Y CRUCIAL DE 20 SEGUNDOS
-    console.log(`[${new Date().toLocaleTimeString()}] [Pausa] Esperando 20 segundos...`);
-    await sleep(20000);
   }
 }
 
