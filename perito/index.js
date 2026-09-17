@@ -25,18 +25,28 @@ function rotateKey() {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function parsearJSONSeguro(texto) {
+  if (!texto) return {};
+  const limpio = texto.replace(/```json/gi, '').replace(/```/g, '').trim();
+  try {
+    return JSON.parse(limpio);
+  } catch (e) {
+    console.error('[Error Parseo JSON]', e.message);
+    return {};
+  }
+}
+
 async function procesarDirecto() {
-  console.log('[Perito Directo] Iniciado. Escuchando PostgreSQL...');
+  console.log('[Perito Directo] Escuchando PostgreSQL...');
 
   while (true) {
     let item = null;
 
-    // 1. Obtener registro de la BD y liberar cliente inmediatamente
     try {
       const res = await pool.query(`
         SELECT hash_imagen, url_imagen, instancia
         FROM registros_raw
-        WHERE estado = 'PENDIENTE' AND conteo >= 2
+        WHERE estado IN ('PENDIENTE', 'EN_COLA') AND conteo >= 2
         LIMIT 1;
       `);
 
@@ -47,20 +57,24 @@ async function procesarDirecto() {
       console.error('[Error Consulta DB]', err.message);
     }
 
-    // Si no hay pendientes, pausar 5s y continuar
     if (!item) {
       await sleep(5000);
       continue;
     }
 
-    // 2. Procesar imagen y consultar Gemini IA
-    try {
-      console.log(`[Procesando] Hash: ${item.hash_imagen}`);
+    console.log(`[Procesando] Hash: ${item.hash_imagen}`);
 
+    try {
+      if (!item.url_imagen) {
+        throw new Error('URL de imagen no encontrada');
+      }
+
+      // 1. Descargar imagen
       const imgRes = await axios.get(item.url_imagen, { responseType: 'arraybuffer', timeout: 15000 });
       const imageBase64 = Buffer.from(imgRes.data).toString('base64');
       const mimeType = imgRes.headers['content-type'] || 'image/jpeg';
 
+      // 2. Extraer datos con Gemini
       const activeKey = getActiveKey();
       const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${activeKey}`;
       const prompt = `Analiza este comprobante de pago o transferencia y extrae estrictamente un objeto JSON:
@@ -87,9 +101,9 @@ async function procesarDirecto() {
       );
 
       const textResult = aiResponse.data?.candidates?.[0]?.content?.parts?.[0]?.text;
-      const datos = JSON.parse(textResult || '{}');
+      const datos = parsearJSONSeguro(textResult);
 
-      // 3. Insertar/Actualizar comprobantes_raw
+      // 3. Guardar en comprobantes_raw
       await pool.query(`
         INSERT INTO comprobantes_raw (
           hash_largo, monto, moneda, banco, referencia, titular, procesado_ia
@@ -111,27 +125,31 @@ async function procesarDirecto() {
         datos.titular || null
       ]);
 
-      // 4. Marcar registro como PROCESADO
+      // 4. Marcar como PROCESADO
       await pool.query(
         `UPDATE registros_raw SET estado = 'PROCESADO' WHERE hash_imagen = $1`,
         [item.hash_imagen]
       );
 
-      console.log(`[OK] Guardado en comprobantes_raw: ${item.hash_imagen}`);
+      console.log(`[OK] Guardado exitosamente: ${item.hash_imagen}`);
 
     } catch (err) {
       const status = err.response?.status;
       const msg = err.response?.data?.error?.message || err.message;
 
-      if (status === 429 || status >= 500) {
+      if (status === 429 || status >= 500 || err.code === 'ETIMEDOUT') {
         rotateKey();
-        console.warn(`[Gemini Reintento ${status || 'Red'}] ${msg}. Reintentando en el siguiente ciclo...`);
+        console.warn(`[Gemini Reintento ${status || 'Red'}] ${msg}. Se mantendrá en cola.`);
       } else {
-        console.error(`[Error Procesamiento] ${msg}`);
+        // Error insalvable de la imagen o del payload: mover a FALLO para desbloquear la cola
+        console.error(`[Error Fatal Registro] ${item.hash_imagen}: ${msg}`);
+        await pool.query(
+          `UPDATE registros_raw SET estado = 'FALLO' WHERE hash_imagen = $1`,
+          [item.hash_imagen]
+        );
       }
     }
 
-    // Pausa de 12 segundos entre peticiones
     await sleep(12000);
   }
 }
