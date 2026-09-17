@@ -43,7 +43,6 @@ async function procesarDirecto() {
     let item = null;
 
     try {
-      // 1. Obtener 1 solo registro bloqueando la fila
       const res = await pool.query(`
         SELECT hash_imagen, url_imagen, instancia
         FROM registros_raw
@@ -57,13 +56,11 @@ async function procesarDirecto() {
       console.error(`[PID:${pid} Error DB Query]`, err.message);
     }
 
-    // Si no hay registros, esperar 5s y reintentar
     if (!item) {
       await sleep(5000);
       continue;
     }
 
-    // Estructura principal con FINALLY garantizado
     try {
       const hora = new Date().toLocaleTimeString();
       console.log(`[${hora}] [PID:${pid}] [INICIO] Hash: ${item.hash_imagen}`);
@@ -73,18 +70,26 @@ async function procesarDirecto() {
         throw new Error('URL nula');
       }
 
-      // Descargar imagen
-      const imgRes = await axios.get(item.url_imagen, { responseType: 'arraybuffer', timeout: 20000 });
+      // CAMBIO 1: Descarga con headers de navegador para traspasar Cloudflare R2
+      const imgRes = await axios.get(item.url_imagen, { 
+        responseType: 'arraybuffer', 
+        timeout: 25000,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
+        }
+      });
+      
       const imageBase64 = Buffer.from(imgRes.data).toString('base64');
       const mimeType = imgRes.headers['content-type'] || 'image/jpeg';
 
-      // Consultar Gemini IA
+      // CAMBIO 2: Prompt con soporte general de moneda (Soles, Pesos, Dólares, etc.)
       const activeKey = getActiveKey();
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${activeKey}`;
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${activeKey}`;
       const prompt = `Analiza este comprobante de pago o transferencia y extrae estrictamente un objeto JSON:
       {
         "monto": number o null,
-        "moneda": "USD" | "VES" | "EUR" | null,
+        "moneda": string o null (ej. "USD", "VES", "PEN", "EUR", "CLP"),
         "banco": string o null,
         "referencia": string o null,
         "titular": string o null
@@ -107,7 +112,6 @@ async function procesarDirecto() {
       const textResult = aiResponse.data?.candidates?.[0]?.content?.parts?.[0]?.text;
       const datos = parsearJSONSeguro(textResult);
 
-      // Guardar en BD
       await pool.query(`
         INSERT INTO comprobantes_raw (
           hash_largo, monto, moneda, banco, referencia, titular, procesado_ia
@@ -144,7 +148,6 @@ async function procesarDirecto() {
         console.warn(`[PID:${pid} Reintento Red/API] ${msg}`);
       }
     } finally {
-      // ESTA PAUSA SE EJECUTA SIEMPRE (ÉXITO O ERROR)
       console.log(`[${new Date().toLocaleTimeString()}] [PID:${pid}] Pausa obligatoria de 20s...`);
       await sleep(20000);
     }
