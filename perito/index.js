@@ -9,20 +9,33 @@ const pool = new Pool({
   database: process.env.DB_NAME,
 });
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const rawKeys = process.env.GEMINI_KEYS || process.env.GEMINI_API_KEY || process.env.GEMINI_KEY || '';
+const geminiKeyList = rawKeys.split(',').map(k => k.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
+let currentKeyIndex = 0;
+
+function getActiveKey() {
+  return geminiKeyList[currentKeyIndex % geminiKeyList.length] || '';
+}
+
+function rotateKey() {
+  if (geminiKeyList.length > 1) {
+    currentKeyIndex = (currentKeyIndex + 1) % geminiKeyList.length;
+  }
+}
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function procesarDirecto() {
-  console.log('[Perito Directo] Iniciado sin Redis. Escuchando PostgreSQL...');
+  console.log('[Perito Directo] Iniciado. Escuchando PostgreSQL...');
 
   while (true) {
     let client;
     try {
       client = await pool.connect();
 
-      // 1. Tomar 1 registro pendiente sin bloquear la tabla
+      // 1. Obtener registro usando url_imagen
       const res = await client.query(`
-        SELECT hash_imagen, imagebase64, mimetype, instancia
+        SELECT hash_imagen, url_imagen, instancia
         FROM registros_raw
         WHERE estado = 'PENDIENTE' AND conteo >= 2
         ORDER BY creado_en ASC
@@ -32,15 +45,21 @@ async function procesarDirecto() {
 
       if (res.rows.length === 0) {
         client.release();
-        await sleep(5000); // Espera 5 segundos si no hay registros pendientes
+        await sleep(5000);
         continue;
       }
 
       const item = res.rows[0];
       console.log(`[Procesando] Hash: ${item.hash_imagen}`);
 
-      // 2. Extracción con Gemini 3.5 Flash
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+      // 2. Descargar la imagen desde su URL y convertir a Base64
+      const imgRes = await axios.get(item.url_imagen, { responseType: 'arraybuffer', timeout: 15000 });
+      const imageBase64 = Buffer.from(imgRes.data).toString('base64');
+      const mimeType = imgRes.headers['content-type'] || 'image/jpeg';
+
+      // 3. Consultar a Gemini 3.5 Flash
+      const activeKey = getActiveKey();
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${activeKey}`;
       const prompt = `Analiza este comprobante de pago o transferencia y extrae estrictamente un objeto JSON:
       {
         "monto": number o null,
@@ -56,7 +75,7 @@ async function procesarDirecto() {
           contents: [{
             parts: [
               { text: prompt },
-              { inline_data: { mime_type: item.mimetype || 'image/jpeg', data: item.imagebase64 } }
+              { inline_data: { mime_type: mimeType, data: imageBase64 } }
             ]
           }],
           generationConfig: { response_mime_type: "application/json" }
@@ -67,7 +86,7 @@ async function procesarDirecto() {
       const textResult = aiResponse.data?.candidates?.[0]?.content?.parts?.[0]?.text;
       const datos = JSON.parse(textResult || '{}');
 
-      // 3. Enriquecer comprobantes_raw usando hash_imagen
+      // 4. Insertar o actualizar comprobantes_raw
       await client.query(`
         INSERT INTO comprobantes_raw (
           hash_largo, monto, moneda, banco, referencia, titular, procesado_ia
@@ -89,23 +108,29 @@ async function procesarDirecto() {
         datos.titular || null
       ]);
 
-      // 4. Marcar como PROCESADO
+      // 5. Marcar como PROCESADO
       await client.query(
         `UPDATE registros_raw SET estado = 'PROCESADO' WHERE hash_imagen = $1`,
         [item.hash_imagen]
       );
 
-      console.log(`[OK] Registrado en comprobantes_raw: ${item.hash_imagen}`);
+      console.log(`[OK] Guardado en comprobantes_raw: ${item.hash_imagen}`);
 
     } catch (err) {
+      const status = err.response?.status;
       const msg = err.response?.data?.error?.message || err.message;
-      console.warn(`[Aviso] Falla en llamada/red: ${msg}. Se reintentará en el siguiente ciclo.`);
-      // No actualiza estado a 'FALLO': se mantiene en 'PENDIENTE' en PostgreSQL
+
+      if (status === 429 || status >= 500) {
+        rotateKey();
+        console.warn(`[Gemini Reintento ${status || 'Red'}] ${msg}. Reintentando en el siguiente ciclo...`);
+      } else {
+        console.error(`[Error] ${msg}`);
+      }
     } finally {
       if (client) client.release();
     }
 
-    // Pausa de 12s para cumplir cuota Free Tier sin saturar a Google
+    // Pausa de 12 segundos para respetar la cuota
     await sleep(12000);
   }
 }
