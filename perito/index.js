@@ -33,12 +33,11 @@ async function procesarDirecto() {
     try {
       client = await pool.connect();
 
-      // 1. Obtener registro usando url_imagen
+      // 1. Obtener 1 registro PENDIENTE (sin ordenar por columna inexistente)
       const res = await client.query(`
         SELECT hash_imagen, url_imagen, instancia
         FROM registros_raw
         WHERE estado = 'PENDIENTE' AND conteo >= 2
-        ORDER BY creado_en ASC
         LIMIT 1
         FOR UPDATE SKIP LOCKED;
       `);
@@ -52,12 +51,12 @@ async function procesarDirecto() {
       const item = res.rows[0];
       console.log(`[Procesando] Hash: ${item.hash_imagen}`);
 
-      // 2. Descargar la imagen desde su URL y convertir a Base64
+      // 2. Descargar imagen desde url_imagen a Base64
       const imgRes = await axios.get(item.url_imagen, { responseType: 'arraybuffer', timeout: 15000 });
       const imageBase64 = Buffer.from(imgRes.data).toString('base64');
       const mimeType = imgRes.headers['content-type'] || 'image/jpeg';
 
-      // 3. Consultar a Gemini 3.5 Flash
+      // 3. Extracción con Gemini 3.5 Flash
       const activeKey = getActiveKey();
       const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${activeKey}`;
       const prompt = `Analiza este comprobante de pago o transferencia y extrae estrictamente un objeto JSON:
@@ -86,7 +85,7 @@ async function procesarDirecto() {
       const textResult = aiResponse.data?.candidates?.[0]?.content?.parts?.[0]?.text;
       const datos = JSON.parse(textResult || '{}');
 
-      // 4. Insertar o actualizar comprobantes_raw
+      // 4. Insertar/Actualizar comprobantes_raw usando hash_imagen como llave
       await client.query(`
         INSERT INTO comprobantes_raw (
           hash_largo, monto, moneda, banco, referencia, titular, procesado_ia
@@ -108,7 +107,7 @@ async function procesarDirecto() {
         datos.titular || null
       ]);
 
-      // 5. Marcar como PROCESADO
+      // 5. Actualizar estado a PROCESADO
       await client.query(
         `UPDATE registros_raw SET estado = 'PROCESADO' WHERE hash_imagen = $1`,
         [item.hash_imagen]
@@ -130,7 +129,7 @@ async function procesarDirecto() {
       if (client) client.release();
     }
 
-    // Pausa de 12 segundos para respetar la cuota
+    // Pausa de 12 segundos para cuota Free Tier
     await sleep(12000);
   }
 }
