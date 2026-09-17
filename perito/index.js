@@ -36,11 +36,12 @@ function parsearJSONSeguro(texto) {
 }
 
 async function procesarDirecto() {
-  console.log('[Perito Directo] Escuchando PostgreSQL con diagnóstico estricto...');
+  console.log('[Perito Directo] Modo 1 a 1 Estricto (Pausa de 20s) Activado...');
 
   while (true) {
     let item = null;
 
+    // 1. Tomar ESTRICTAMENTE 1 solo registro
     try {
       const res = await pool.query(`
         SELECT hash_imagen, url_imagen, instancia
@@ -54,34 +55,36 @@ async function procesarDirecto() {
       console.error('[Error Consulta DB]', err.message);
     }
 
+    // Si no hay pendientes, espera 5 segundos y vuelve a consultar
     if (!item) {
       await sleep(5000);
       continue;
     }
 
-    console.log(`[Procesando] Hash: ${item.hash_imagen}`);
+    console.log(`[Procesando 1 a 1] Hash: ${item.hash_imagen}`);
 
-    // PASO 1: Descargar imagen (Única fase que puede marcar FALLO)
+    // PASO 1: Descargar imagen con manejo aislado de error
     let imageBase64, mimeType;
     try {
-      if (!item.url_imagen) throw { isImageError: true, message: 'URL nula o vacía' };
+      if (!item.url_imagen) throw { isImageError: true, message: 'URL vacía' };
 
       const imgRes = await axios.get(item.url_imagen, { responseType: 'arraybuffer', timeout: 20000 });
       imageBase64 = Buffer.from(imgRes.data).toString('base64');
       mimeType = imgRes.headers['content-type'] || 'image/jpeg';
     } catch (imgErr) {
       const imgStatus = imgErr.response?.status;
-      console.error(`[Error Descarga Imagen] Hash ${item.hash_imagen}: HTTP ${imgStatus || 'RED'} - ${imgErr.message}`);
+      console.error(`[Error Descarga Imagen] Hash ${item.hash_imagen}: HTTP ${imgStatus || 'RED'}`);
 
-      // Solo si la imagen NO EXISTE en Cloudflare R2 se marca como FALLO
+      // Solo si la imagen NO existe (404/410), se marca como FALLO
       if (imgStatus === 404 || imgStatus === 410 || imgErr.isImageError) {
         await pool.query(`UPDATE registros_raw SET estado = 'FALLO' WHERE hash_imagen = $1`, [item.hash_imagen]);
       }
-      await sleep(5000);
-      continue; // Salta al siguiente ciclo sin tocar Gemini
+      // Si fue parpadeo de red, permanece en PENDIENTE y espera 20s
+      await sleep(20000);
+      continue;
     }
 
-    // PASO 2: Consulta IA y Guardado en DB (NUNCA marca FALLO el registro)
+    // PASO 2: Extraer con Gemini e insertar en PostgreSQL
     try {
       const activeKey = getActiveKey();
       const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${activeKey}`;
@@ -139,11 +142,11 @@ async function procesarDirecto() {
       rotateKey();
       const status = apiErr.response?.status;
       const detail = apiErr.response?.data?.error?.message || apiErr.message;
-      console.error(`[Error Sistema/API - HTTP ${status || 'DB/Internal'}] ${detail}`);
-      // Se mantiene en PENDIENTE para reintentar en el próximo ciclo
+      console.warn(`[Reintento API/Red - HTTP ${status || 'Error'}] ${detail}. Se mantiene en cola.`);
     }
 
-    await sleep(15000);
+    // Pausa estricta de 20 segundos antes de tomar el SIGUIENTE registro
+    await sleep(20000);
   }
 }
 
