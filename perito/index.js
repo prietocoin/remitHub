@@ -31,13 +31,28 @@ function parsearJSONSeguro(texto) {
   try {
     return JSON.parse(limpio);
   } catch (e) {
-    console.error('[Error Parseo JSON]', e.message);
     return {};
   }
 }
 
+// Descarga la imagen con hasta 3 reintentos antes de desistir
+async function descargarImagenConReintento(url) {
+  for (let i = 1; i <= 3; i++) {
+    try {
+      const res = await axios.get(url, { responseType: 'arraybuffer', timeout: 20000 });
+      return {
+        base64: Buffer.from(res.data).toString('base64'),
+        mimeType: res.headers['content-type'] || 'image/jpeg'
+      };
+    } catch (err) {
+      if (i === 3) throw err;
+      await sleep(3000);
+    }
+  }
+}
+
 async function procesarDirecto() {
-  console.log('[Perito Directo] Escuchando PostgreSQL...');
+  console.log('[Perito Directo] Modo 1 a 1 Secuencial Activado.');
 
   while (true) {
     let item = null;
@@ -62,19 +77,15 @@ async function procesarDirecto() {
       continue;
     }
 
-    console.log(`[Procesando] Hash: ${item.hash_imagen}`);
+    console.log(`[Inicio Procesamiento 1 a 1] Hash: ${item.hash_imagen}`);
 
     try {
-      if (!item.url_imagen) {
-        throw new Error('URL de imagen no encontrada');
-      }
+      if (!item.url_imagen) throw new Error('Registro sin URL de imagen');
 
-      // 1. Descargar imagen
-      const imgRes = await axios.get(item.url_imagen, { responseType: 'arraybuffer', timeout: 15000 });
-      const imageBase64 = Buffer.from(imgRes.data).toString('base64');
-      const mimeType = imgRes.headers['content-type'] || 'image/jpeg';
+      // 1. Descargar imagen con reintentos
+      const { base64, mimeType } = await descargarImagenConReintento(item.url_imagen);
 
-      // 2. Extraer datos con Gemini
+      // 2. Extracción con Gemini 3.5 Flash
       const activeKey = getActiveKey();
       const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${activeKey}`;
       const prompt = `Analiza este comprobante de pago o transferencia y extrae estrictamente un objeto JSON:
@@ -92,12 +103,12 @@ async function procesarDirecto() {
           contents: [{
             parts: [
               { text: prompt },
-              { inline_data: { mime_type: mimeType, data: imageBase64 } }
+              { inline_data: { mime_type: mimeType, data: base64 } }
             ]
           }],
           generationConfig: { response_mime_type: "application/json" }
         },
-        { timeout: 30000 }
+        { timeout: 35000 }
       );
 
       const textResult = aiResponse.data?.candidates?.[0]?.content?.parts?.[0]?.text;
@@ -131,18 +142,19 @@ async function procesarDirecto() {
         [item.hash_imagen]
       );
 
-      console.log(`[OK] Guardado exitosamente: ${item.hash_imagen}`);
+      console.log(`[ÉXITO] Procesado e Insertado: ${item.hash_imagen}`);
 
     } catch (err) {
       const status = err.response?.status;
       const msg = err.response?.data?.error?.message || err.message;
 
-      if (status === 429 || status >= 500 || err.code === 'ETIMEDOUT') {
+      // Errores temporales de API o red: NO cambian a FALLO, reintentan en el siguiente ciclo
+      if (status === 429 || status >= 500 || err.code === 'ETIMEDOUT' || err.code === 'ECONNRESET') {
         rotateKey();
-        console.warn(`[Gemini Reintento ${status || 'Red'}] ${msg}. Se mantendrá en cola.`);
+        console.warn(`[Reintento Temporal - ${status || err.code}] ${msg}. Permanece en cola.`);
       } else {
-        // Error insalvable de la imagen o del payload: mover a FALLO para desbloquear la cola
-        console.error(`[Error Fatal Registro] ${item.hash_imagen}: ${msg}`);
+        // Solo falla si la URL no existe (404) o el archivo está corrupto tras reintentos
+        console.error(`[Fallo Incurable] Hash ${item.hash_imagen}: ${msg}`);
         await pool.query(
           `UPDATE registros_raw SET estado = 'FALLO' WHERE hash_imagen = $1`,
           [item.hash_imagen]
@@ -150,7 +162,8 @@ async function procesarDirecto() {
       }
     }
 
-    await sleep(12000);
+    // Pausa garantizada de 15 segundos para procesamiento 1 a 1 sin saturación
+    await sleep(15000);
   }
 }
 
