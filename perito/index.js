@@ -36,56 +36,43 @@ function parsearJSONSeguro(texto) {
 }
 
 async function procesarDirecto() {
-  console.log('[Perito Directo] Modo 1 a 1 Estricto (Pausa de 20s) Activado...');
+  console.log('[Perito Directo] Iniciado en modo 1 a 1 estricto (Pausa de 20s)...');
 
   while (true) {
     let item = null;
 
-    // 1. Tomar ESTRICTAMENTE 1 solo registro
     try {
+      // Bloqueo de fila para prevenir lecturas duplicadas
       const res = await pool.query(`
         SELECT hash_imagen, url_imagen, instancia
         FROM registros_raw
         WHERE estado IN ('PENDIENTE', 'EN_COLA') AND conteo >= 2
-        LIMIT 1;
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED;
       `);
 
       if (res.rows.length > 0) item = res.rows[0];
     } catch (err) {
-      console.error('[Error Consulta DB]', err.message);
+      console.error('[Error DB]', err.message);
     }
 
-    // Si no hay pendientes, espera 5 segundos y vuelve a consultar
     if (!item) {
       await sleep(5000);
       continue;
     }
 
-    console.log(`[Procesando 1 a 1] Hash: ${item.hash_imagen}`);
+    const horaInicio = new Date().toLocaleTimeString();
+    console.log(`[${horaInicio}] [Inicio] Hash: ${item.hash_imagen}`);
 
-    // PASO 1: Descargar imagen con manejo aislado de error
-    let imageBase64, mimeType;
     try {
-      if (!item.url_imagen) throw { isImageError: true, message: 'URL vacía' };
+      if (!item.url_imagen) throw { isImageError: true, message: 'URL nula' };
 
+      // 1. Descarga de imagen
       const imgRes = await axios.get(item.url_imagen, { responseType: 'arraybuffer', timeout: 20000 });
-      imageBase64 = Buffer.from(imgRes.data).toString('base64');
-      mimeType = imgRes.headers['content-type'] || 'image/jpeg';
-    } catch (imgErr) {
-      const imgStatus = imgErr.response?.status;
-      console.error(`[Error Descarga Imagen] Hash ${item.hash_imagen}: HTTP ${imgStatus || 'RED'}`);
+      const imageBase64 = Buffer.from(imgRes.data).toString('base64');
+      const mimeType = imgRes.headers['content-type'] || 'image/jpeg';
 
-      // Solo si la imagen NO existe (404/410), se marca como FALLO
-      if (imgStatus === 404 || imgStatus === 410 || imgErr.isImageError) {
-        await pool.query(`UPDATE registros_raw SET estado = 'FALLO' WHERE hash_imagen = $1`, [item.hash_imagen]);
-      }
-      // Si fue parpadeo de red, permanece en PENDIENTE y espera 20s
-      await sleep(20000);
-      continue;
-    }
-
-    // PASO 2: Extraer con Gemini e insertar en PostgreSQL
-    try {
+      // 2. Consulta a Gemini IA
       const activeKey = getActiveKey();
       const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${activeKey}`;
       const prompt = `Analiza este comprobante de pago o transferencia y extrae estrictamente un objeto JSON:
@@ -114,6 +101,7 @@ async function procesarDirecto() {
       const textResult = aiResponse.data?.candidates?.[0]?.content?.parts?.[0]?.text;
       const datos = parsearJSONSeguro(textResult);
 
+      // 3. Guardar en BD
       await pool.query(`
         INSERT INTO comprobantes_raw (
           hash_largo, monto, moneda, banco, referencia, titular, procesado_ia
@@ -136,16 +124,25 @@ async function procesarDirecto() {
       ]);
 
       await pool.query(`UPDATE registros_raw SET estado = 'PROCESADO' WHERE hash_imagen = $1`, [item.hash_imagen]);
-      console.log(`[ÉXITO] ${item.hash_imagen}`);
+      
+      const horaFin = new Date().toLocaleTimeString();
+      console.log(`[${horaFin}] [ÉXITO] Completado: ${item.hash_imagen}`);
 
-    } catch (apiErr) {
-      rotateKey();
-      const status = apiErr.response?.status;
-      const detail = apiErr.response?.data?.error?.message || apiErr.message;
-      console.warn(`[Reintento API/Red - HTTP ${status || 'Error'}] ${detail}. Se mantiene en cola.`);
+    } catch (err) {
+      const status = err.response?.status;
+      const msg = err.response?.data?.error?.message || err.message;
+
+      if (status === 404 || status === 410 || err.isImageError) {
+        console.error(`[Imagen no disponible/404] Hash ${item.hash_imagen}`);
+        await pool.query(`UPDATE registros_raw SET estado = 'FALLO' WHERE hash_imagen = $1`, [item.hash_imagen]);
+      } else {
+        rotateKey();
+        console.warn(`[Reintento Red/API HTTP ${status || 'Error'}] ${msg}`);
+      }
     }
 
-    // Pausa estricta de 20 segundos antes de tomar el SIGUIENTE registro
+    // PAUSA OBLIGATORIA Y CRUCIAL DE 20 SEGUNDOS
+    console.log(`[${new Date().toLocaleTimeString()}] [Pausa] Esperando 20 segundos...`);
     await sleep(20000);
   }
 }
