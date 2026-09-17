@@ -29,34 +29,38 @@ async function procesarDirecto() {
   console.log('[Perito Directo] Iniciado. Escuchando PostgreSQL...');
 
   while (true) {
-    let client;
-    try {
-      client = await pool.connect();
+    let item = null;
 
-      // 1. Obtener 1 registro PENDIENTE (sin ordenar por columna inexistente)
-      const res = await client.query(`
+    // 1. Obtener registro de la BD y liberar cliente inmediatamente
+    try {
+      const res = await pool.query(`
         SELECT hash_imagen, url_imagen, instancia
         FROM registros_raw
         WHERE estado = 'PENDIENTE' AND conteo >= 2
-        LIMIT 1
-        FOR UPDATE SKIP LOCKED;
+        LIMIT 1;
       `);
 
-      if (res.rows.length === 0) {
-        client.release();
-        await sleep(5000);
-        continue;
+      if (res.rows.length > 0) {
+        item = res.rows[0];
       }
+    } catch (err) {
+      console.error('[Error Consulta DB]', err.message);
+    }
 
-      const item = res.rows[0];
+    // Si no hay pendientes, pausar 5s y continuar
+    if (!item) {
+      await sleep(5000);
+      continue;
+    }
+
+    // 2. Procesar imagen y consultar Gemini IA
+    try {
       console.log(`[Procesando] Hash: ${item.hash_imagen}`);
 
-      // 2. Descargar imagen desde url_imagen a Base64
       const imgRes = await axios.get(item.url_imagen, { responseType: 'arraybuffer', timeout: 15000 });
       const imageBase64 = Buffer.from(imgRes.data).toString('base64');
       const mimeType = imgRes.headers['content-type'] || 'image/jpeg';
 
-      // 3. Extracción con Gemini 3.5 Flash
       const activeKey = getActiveKey();
       const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${activeKey}`;
       const prompt = `Analiza este comprobante de pago o transferencia y extrae estrictamente un objeto JSON:
@@ -85,8 +89,8 @@ async function procesarDirecto() {
       const textResult = aiResponse.data?.candidates?.[0]?.content?.parts?.[0]?.text;
       const datos = JSON.parse(textResult || '{}');
 
-      // 4. Insertar/Actualizar comprobantes_raw usando hash_imagen como llave
-      await client.query(`
+      // 3. Insertar/Actualizar comprobantes_raw
+      await pool.query(`
         INSERT INTO comprobantes_raw (
           hash_largo, monto, moneda, banco, referencia, titular, procesado_ia
         )
@@ -107,8 +111,8 @@ async function procesarDirecto() {
         datos.titular || null
       ]);
 
-      // 5. Actualizar estado a PROCESADO
-      await client.query(
+      // 4. Marcar registro como PROCESADO
+      await pool.query(
         `UPDATE registros_raw SET estado = 'PROCESADO' WHERE hash_imagen = $1`,
         [item.hash_imagen]
       );
@@ -123,13 +127,11 @@ async function procesarDirecto() {
         rotateKey();
         console.warn(`[Gemini Reintento ${status || 'Red'}] ${msg}. Reintentando en el siguiente ciclo...`);
       } else {
-        console.error(`[Error] ${msg}`);
+        console.error(`[Error Procesamiento] ${msg}`);
       }
-    } finally {
-      if (client) client.release();
     }
 
-    // Pausa de 12 segundos para cuota Free Tier
+    // Pausa de 12 segundos entre peticiones
     await sleep(12000);
   }
 }
