@@ -1,6 +1,8 @@
 const { Pool } = require('pg');
 const axios = require('axios');
+const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 
+// Configuración de la base de datos PostgreSQL
 const pool = new Pool({
   host: process.env.DB_HOST,
   port: Number(process.env.DB_PORT) || 5432,
@@ -9,6 +11,17 @@ const pool = new Pool({
   database: process.env.DB_NAME,
 });
 
+// Configuración del cliente S3 para Cloudflare R2
+const s3Client = new S3Client({
+  region: 'auto',
+  endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  credentials: {
+    accessKeyId: process.env.R2_ACCESS_KEY_ID || '',
+    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY || '',
+  },
+});
+
+// Gestión de claves de la API de Gemini
 const rawKeys = process.env.GEMINI_KEYS || process.env.GEMINI_API_KEY || process.env.GEMINI_KEY || '';
 const geminiKeyList = rawKeys.split(',').map(k => k.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
 let currentKeyIndex = 0;
@@ -32,6 +45,16 @@ function parsearJSONSeguro(texto) {
     return JSON.parse(limpio);
   } catch (e) {
     return {};
+  }
+}
+
+// Extrae la clave relativa de la imagen a partir de la URL almacenada en BD
+function obtenerClaveR2(url) {
+  try {
+    const parsedUrl = new URL(url);
+    return decodeURIComponent(parsedUrl.pathname.replace(/^\//, ''));
+  } catch (e) {
+    return url.replace(/^\//, '');
   }
 }
 
@@ -70,20 +93,19 @@ async function procesarDirecto() {
         throw new Error('URL nula');
       }
 
-      // CAMBIO 1: Descarga con headers de navegador para traspasar Cloudflare R2
-      const imgRes = await axios.get(item.url_imagen, { 
-        responseType: 'arraybuffer', 
-        timeout: 25000,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-          'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
-        }
+      // DESCARGA DIRECTA DE R2 (Sin bloqueos de Cloudflare WAF)
+      const keyObjeto = obtenerClaveR2(item.url_imagen);
+      const command = new GetObjectCommand({
+        Bucket: process.env.R2_BUCKET_NAME || 'remesas-img',
+        Key: keyObjeto,
       });
-      
-      const imageBase64 = Buffer.from(imgRes.data).toString('base64');
-      const mimeType = imgRes.headers['content-type'] || 'image/jpeg';
 
-      // CAMBIO 2: Prompt con soporte general de moneda (Soles, Pesos, Dólares, etc.)
+      const s3Response = await s3Client.send(command);
+      const byteArray = await s3Response.Body.transformToByteArray();
+      const imageBase64 = Buffer.from(byteArray).toString('base64');
+      const mimeType = s3Response.ContentType || 'image/jpeg';
+
+      // PROCESAMIENTO CON GEMINI AI
       const activeKey = getActiveKey();
       const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${activeKey}`;
       const prompt = `Analiza este comprobante de pago o transferencia y extrae estrictamente un objeto JSON:
@@ -137,11 +159,11 @@ async function procesarDirecto() {
       console.log(`[${new Date().toLocaleTimeString()}] [PID:${pid}] [ÉXITO] ${item.hash_imagen}`);
 
     } catch (err) {
-      const status = err.response?.status;
+      const status = err.response?.status || err.$metadata?.httpStatusCode;
       const msg = err.response?.data?.error?.message || err.message;
 
-      if (status === 404 || status === 410) {
-        console.error(`[PID:${pid} Imagen 404] Hash ${item.hash_imagen}`);
+      if (status === 404 || status === 410 || err.name === 'NoSuchKey') {
+        console.error(`[PID:${pid} Imagen No Encontrada/404] Hash ${item.hash_imagen}`);
         await pool.query(`UPDATE registros_raw SET estado = 'FALLO' WHERE hash_imagen = $1`, [item.hash_imagen]);
       } else {
         rotateKey();
