@@ -1,0 +1,16 @@
+{
+  "name": "extractor",
+  "version": "1.0.0",
+  "description": "Módulo Capa 3: Inferencia IA con Gemini, lectura desde R2",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.540.0",
+    "axios": "^1.6.8",
+    "bullmq": "^5.7.0",
+    "ioredis": "^5.4.1"
+  }
+}
