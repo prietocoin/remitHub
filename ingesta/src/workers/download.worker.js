@@ -23,6 +23,17 @@ const downloadWorker = new Worker('cola-descarga-media', async (job) => {
     imageBuffer = await obtenerBufferImagen(instancia, key, message);
   }
 
+  // --- LOG DE DIAGNÓSTICO ---
+  if (imageBuffer) {
+    console.log(`[Worker Descarga] 🟢 Buffer obtenido con éxito (${imageBuffer.length} bytes). Generando SHA-256 del BINARIO.`);
+  } else {
+    console.log(`[Worker Descarga] ⚠️ ALERTA: Buffer es NULL. Usando Fallback de key.id (${key.id}).`);
+  }
+  // ---------------------------
+
+  // 2. Generar huella SHA-256 (64 caracteres Hex)
+  const hash_largo = generarSha256(imageBuffer, key.id || body.key_id);
+  const hash_corto = hash_largo.slice(-8);
   // 2. Generar huella SHA-256 (64 caracteres Hex)
   const hash_largo = generarSha256(imageBuffer, key.id || body.key_id);
   const hash_corto = hash_largo.slice(-8);
