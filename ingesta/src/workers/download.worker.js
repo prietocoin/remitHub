@@ -34,9 +34,7 @@ const downloadWorker = new Worker('cola-descarga-media', async (job) => {
   // 2. Generar huella SHA-256 (64 caracteres Hex)
   const hash_largo = generarSha256(imageBuffer, key.id || body.key_id);
   const hash_corto = hash_largo.slice(-8);
-  // 2. Generar huella SHA-256 (64 caracteres Hex)
-  const hash_largo = generarSha256(imageBuffer, key.id || body.key_id);
-  const hash_corto = hash_largo.slice(-8);
+ 
 
   // 3. Subir a Cloudflare R2 si existe la imagen
   let key_r2 = null;
