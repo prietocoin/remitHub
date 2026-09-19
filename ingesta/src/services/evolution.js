@@ -1,40 +1,60 @@
 const axios = require('axios');
 
-async function obtenerBufferImagen(instancia, key, message) {
+async function obtenerBufferImagen(instancia, instanceId, key) {
   const baseUrl = process.env.EVOLUTION_API_URL;
   const apiKey = process.env.AUTHENTICATION_API_KEY || process.env.EVOLUTION_API_KEY;
 
   if (!baseUrl) {
-    console.error('[Evolution Service] ❌ EVOLUTION_API_URL no configurada');
+    console.error('[Evolution Service] ❌ EVOLUTION_API_URL no configurada en entorno');
     return null;
   }
 
+  const cleanBaseUrl = baseUrl.replace(/\/$/, '');
+  
+  // Payload simplificado y estricto que requiere Evolution API
+  const payload = {
+    message: {
+      key: key
+    },
+    convertToMp4: false
+  };
+
+  const headers = {
+    'apikey': apiKey,
+    'Content-Type': 'application/json'
+  };
+
+  // Intentar primero con el identificador primario (instance name)
+  let target = instancia || instanceId;
+  let url = `${cleanBaseUrl}/message/getBase64FromMediaMessage/${target}`;
+
   try {
-    const cleanBaseUrl = baseUrl.replace(/\/$/, '');
-    const url = `${cleanBaseUrl}/message/getBase64FromMediaMessage/${instancia}`;
-
-    const response = await axios.post(url, {
-      message: {
-        key: key,
-        message: message
-      }
-    }, {
-      headers: {
-        'apikey': apiKey,
-        'Content-Type': 'application/json'
-      },
-      timeout: 15000
-    });
-
+    const response = await axios.post(url, payload, { headers, timeout: 15000 });
     const base64Data = response.data?.base64 || response.data?.media;
+    
     if (typeof base64Data === 'string') {
       const cleanBase64 = base64Data.replace(/^data:image\/\w+;base64,/, '');
       return Buffer.from(cleanBase64, 'base64');
-    } else {
-      console.error('[Evolution Service ⚠️] Respuesta sin Base64:', JSON.stringify(response.data));
     }
   } catch (err) {
-    console.error(`[Evolution Service ERROR] HTTP ${err.response?.status || '500'} (${instancia}):`, err.message);
+    // Si falla con 404 y tenemos un instanceId alternativo (UUID), intentamos la segunda vía
+    if (err.response?.status === 404 && instanceId && target !== instanceId) {
+      console.warn(`[Evolution Service ⚠️] 404 con instancia "${target}". Reintentando con instanceId UUID "${instanceId}"...`);
+      try {
+        const fallbackUrl = `${cleanBaseUrl}/message/getBase64FromMediaMessage/${instanceId}`;
+        const responseFallback = await axios.post(fallbackUrl, payload, { headers, timeout: 15000 });
+        const base64Data = responseFallback.data?.base64 || responseFallback.data?.media;
+        
+        if (typeof base64Data === 'string') {
+          const cleanBase64 = base64Data.replace(/^data:image\/\w+;base64,/, '');
+          return Buffer.from(cleanBase64, 'base64');
+        }
+      } catch (fallbackErr) {
+        console.error(`[Evolution Service ERROR] Fallaron ambos identificadores para multitenant (${instancia} / ${instanceId}):`, fallbackErr.message);
+      }
+    } else {
+      console.error(`[Evolution Service ERROR] HTTP ${err.response?.status || '500'} (${target}):`, err.response?.data?.message || err.message);
+    }
   }
 
   return null;
