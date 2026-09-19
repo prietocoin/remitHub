@@ -1,8 +1,6 @@
 const { Worker, Queue } = require('bullmq');
 const Redis = require('ioredis');
 const { Pool } = require('pg');
-const axios = require('axios');
-const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 
 // 1. Conexiones
 const pool = new Pool({
@@ -20,16 +18,7 @@ const redisConnection = new Redis({
   maxRetriesPerRequest: null,
 });
 
-const s3Client = new S3Client({
-  region: 'auto',
-  endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-  credentials: {
-    accessKeyId: process.env.R2_ACCESS_KEY_ID,
-    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
-  },
-});
-
-// 2. Cola de destino
+// 2. Cola de destino hacia el Extractor
 const colaExtractor = new Queue('cola-extractor', { connection: redisConnection });
 
 // 3. Worker: Escucha la cola-validador
@@ -38,7 +27,7 @@ const worker = new Worker('cola-validador', async (job) => {
   console.log(`[Validador] ⚙️ Trabajo recibido de Redis. Hash: ${payload?.hash_largo || 'DESCONOCIDO'}`);
 
   try {
-    // A. Guardar/Actualizar en registros_raw
+    // A. Guardar o incrementar conteo en registros_raw
     const { rows } = await pool.query(`
       INSERT INTO registros_raw (
         hash_largo, hash_corto, grupo_raw, usuario_raw, nombre_push, 
@@ -60,83 +49,83 @@ const worker = new Worker('cola-validador', async (job) => {
       payload.timestamp_msg || Math.floor(Date.now() / 1000),
       Boolean(payload.es_imagen),
       payload.instancia || 'JAIRO',
-      payload.url_imagen || null
+      payload.url_r2 || payload.url_imagen || null
     ]);
 
     const registro = rows[0];
     console.log(`[Validador] 📊 Estado en DB -> Conteo: ${registro.conteo}x | Estado: ${registro.estado}`);
 
-    // B. Regla de Negocio: Procesar solo si es Binomio (>= 2x)
-    if (registro.conteo >= 2 && registro.estado === 'RECIBIDO' && registro.url_imagen) {
-      console.log(`[Validador] 🚀 Binomio 2x detectado. Descargando imagen desde WhatsApp...`);
+    // B. Regla de Negocio: Activar solo si alcanza el Binomio (>= 2x)
+    if (registro.conteo >= 2 && registro.estado === 'RECIBIDO') {
+      console.log(`[Validador] 🚀 Binomio 2x alcanzado para: ${payload.hash_largo}`);
 
-      // C. Descargar imagen
-      const res = await axios.get(registro.url_imagen, { responseType: 'arraybuffer', timeout: 15000 });
-      const buffer = Buffer.from(res.data);
-      const mimeType = res.headers['content-type'] || 'image/jpeg';
-      const ext = mimeType.split('/')[1] || 'jpg';
-      const keyObjeto = `comprobantes/${payload.hash_largo}.${ext}`;
+      // Transacción atómica en PostgreSQL
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
 
-      // D. Subir a Cloudflare R2
-      console.log(`[Validador] ☁️ Subiendo imagen a Cloudflare R2: ${keyObjeto}`);
-      await s3Client.send(new PutObjectCommand({
-        Bucket: process.env.R2_BUCKET_NAME || 'remesas-img',
-        Key: keyObjeto,
-        Body: buffer,
-        ContentType: mimeType
-      }));
+        // Insertar/actualizar en la tabla operativa de comprobantes
+        await client.query(`
+          INSERT INTO comprobantes_raw (hash_largo, instancia, url_r2, estado_ia) 
+          VALUES ($1, $2, $3, 'LISTO_PARA_IA')
+          ON CONFLICT (hash_largo) DO UPDATE SET 
+            url_r2 = COALESCE(EXCLUDED.url_r2, comprobantes_raw.url_r2),
+            estado_ia = 'LISTO_PARA_IA';
+        `, [
+          payload.hash_largo, 
+          payload.instancia || 'JAIRO', 
+          payload.url_r2 || registro.url_imagen || null
+        ]);
 
-      const urlR2 = `https://${process.env.R2_PUBLIC_DOMAIN}/${keyObjeto}`;
+        // Cambiar estado en auditoría a EN_COLA para prevenir doble procesamiento
+        await client.query(`
+          UPDATE registros_raw SET estado = 'EN_COLA' WHERE hash_largo = $1;
+        `, [payload.hash_largo]);
 
-      // E. Transacción SQL: Insertar comprobante y actualizar estado
-      await pool.query('BEGIN');
-      await pool.query(`
-        INSERT INTO comprobantes_raw (hash_largo, instancia, url_r2, estado_ia) 
-        VALUES ($1, $2, $3, 'LISTO_PARA_IA')
-        ON CONFLICT (hash_largo) DO UPDATE SET url_r2 = EXCLUDED.url_r2;
-      `, [payload.hash_largo, payload.instancia || 'JAIRO', urlR2]);
+        await client.query('COMMIT');
+      } catch (dbErr) {
+        await client.query('ROLLBACK');
+        throw dbErr;
+      } finally {
+        client.release();
+      }
 
-      await pool.query(`
-        UPDATE registros_raw SET estado = 'EN_COLA' WHERE hash_largo = $1;
-      `, [payload.hash_largo]);
-      await pool.query('COMMIT');
-
-      // F. Empujar al Extractor
+      // C. Despachar a la cola del Extractor
       await colaExtractor.add('extraer-datos', {
         hash_largo: payload.hash_largo,
         instancia: payload.instancia || 'JAIRO',
-        key_r2: keyObjeto
+        key_r2: payload.key_r2,
+        url_r2: payload.url_r2 || registro.url_imagen
       }, { removeOnComplete: true });
 
-      console.log(`[Validador] ✅ Binomio 2x completado y encolado en "cola-extractor": ${payload.hash_largo}`);
+      console.log(`[Validador] ✅ Evento derivado al Extractor: ${payload.hash_largo}`);
     } else {
-      console.log(`[Validador] ⏳ 1x guardado exitosamente en DB, esperando pareja. Hash: ${payload.hash_largo}`);
+      console.log(`[Validador] ⏳ 1x registrado. En espera del segundo impacto para el Hash: ${payload.hash_largo}`);
     }
 
   } catch (err) {
-    await pool.query('ROLLBACK').catch(() => {});
     console.error(`[Validador ERROR] Falló el procesamiento del Hash ${payload?.hash_largo}:`, err.message);
-    throw err; // Re-lanzar para que BullMQ registre el fallo en la cola
+    throw err;
   }
 }, { 
   connection: redisConnection, 
   concurrency: 5 
 });
 
-// Eventos globales del Worker para depuración en consola
+// Eventos de monitoreo
 worker.on('completed', (job) => {
-  console.log(`[Validador Evento] 🎉 Trabajo ${job.id} finalizado con éxito.`);
+  console.log(`[Validador Evento] 🎉 Job ${job.id} procesado.`);
 });
 
 worker.on('failed', (job, err) => {
-  console.error(`[Validador Evento] ❌ Trabajo ${job?.id} falló. Razón: ${err.message}`);
+  console.error(`[Validador Evento] ❌ Job ${job?.id} falló: ${err.message}`);
 });
 
 worker.on('error', (err) => {
-  console.error('[Validador Error Crítico de Conexión]', err.message);
+  console.error('[Validador Error Crítico]', err.message);
 });
 
-// 4. Cron de Limpieza (Cada 1 hora)
+// Cron de Limpieza (Cada 1 hora): Marca caducados los 1x huérfanos tras 48 horas
 setInterval(async () => {
   try {
     const { rowCount } = await pool.query(`
@@ -146,10 +135,10 @@ setInterval(async () => {
       AND estado = 'RECIBIDO'
       AND timestamp_msg::bigint < (EXTRACT(EPOCH FROM NOW()) - 172800)
     `);
-    if (rowCount > 0) console.log(`[Validador Limpieza] ${rowCount} registros (1x) caducados.`);
+    if (rowCount > 0) console.log(`[Validador Limpieza] ${rowCount} registros (1x) marcados como CADUCADO.`);
   } catch (error) {
-    console.error('[Validador Error Limpieza]', error.message);
+    console.error('[Validador Limpieza ERROR]', error.message);
   }
 }, 3600000);
 
-console.log('[Validador] 🟢 Worker activo y listo. Escuchando "cola-validador"...');
+console.log('[Validador] 🟢 Worker activo y en escucha.');
