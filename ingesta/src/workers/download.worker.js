@@ -6,23 +6,14 @@ const { obtenerBufferImagen } = require('../services/evolution');
 const { generarSha256 } = require('../services/hash');
 const validadorQueue = require('../queues/validador.queue');
 
-/**
- * Convierte el objeto de bytes fileSha256 {"0":245, "1":5, ...} a string Hexadecimal de 64 caracteres
- */
 function extraerSha256Nativo(fileShaObj) {
   if (!fileShaObj) return null;
   try {
-    if (Buffer.isBuffer(fileShaObj)) {
-      return fileShaObj.toString('hex').toUpperCase();
-    }
-    if (typeof fileShaObj === 'string') {
-      return fileShaObj.toUpperCase();
-    }
+    if (Buffer.isBuffer(fileShaObj)) return fileShaObj.toString('hex').toUpperCase();
+    if (typeof fileShaObj === 'string') return fileShaObj.toUpperCase();
     if (typeof fileShaObj === 'object') {
       const bytes = Object.values(fileShaObj);
-      if (bytes.length === 32) {
-        return Buffer.from(bytes).toString('hex').toUpperCase();
-      }
+      if (bytes.length === 32) return Buffer.from(bytes).toString('hex').toUpperCase();
     }
   } catch (e) {
     return null;
@@ -33,7 +24,6 @@ function extraerSha256Nativo(fileShaObj) {
 const downloadWorker = new Worker('cola-descarga-media', async (job) => {
   const { rawPayload } = job.data;
   
-  // Desempaquetar array externo enviado por n8n: [{ headers, body: {...} }]
   const item = Array.isArray(rawPayload) ? rawPayload[0] : rawPayload;
   const body = item?.body || item || {};
   const data = body?.data || {};
@@ -41,31 +31,34 @@ const downloadWorker = new Worker('cola-descarga-media', async (job) => {
   const key = data?.key || {};
   const message = data?.message || {};
   const imageMsg = message?.imageMessage;
-  const instancia = body?.instance || data?.instance || 'John';
+
+  // Extracción 100% Dinámica Multitenant
+  const instancia = body?.instance || data?.instance || null;
+  const instanceId = data?.instanceId || body?.instanceId || null;
 
   const es_imagen = Boolean(imageMsg || body?.es_imagen);
   let imageBuffer = null;
 
-  // 1. Descargar imagen desde Evolution API
-  if (es_imagen) {
-    console.log(`[Worker Descarga] 🔄 Solicitando Base64 a Evolution API (Instancia: ${instancia})...`);
-    imageBuffer = await obtenerBufferImagen(instancia, key, message);
+  // 1. Descargar imagen desde Evolution API usando resolutor multitenant
+  if (es_imagen && key.id) {
+    console.log(`[Worker Descarga] 🔄 Pidiendo imagen a Evolution API (Tenant: "${instancia || instanceId}")...`);
+    imageBuffer = await obtenerBufferImagen(instancia, instanceId, key);
   }
 
-  // 2. Extraer SHA-256 nativo de WhatsApp o calcular desde Buffer
+  // 2. Resolver SHA-256 (Prioridad: WhatsApp Nativo > Buffer > Fallback)
   const shaNativoWhatsApp = extraerSha256Nativo(imageMsg?.fileSha256);
   let hash_largo = null;
 
   if (shaNativoWhatsApp) {
     hash_largo = shaNativoWhatsApp;
-    console.log(`[Worker Descarga] 🎯 SHA-256 Nativo extraído de WhatsApp: ${hash_largo}`);
+    console.log(`[Worker Descarga] 🎯 SHA-256 Nativo: ${hash_largo}`);
   } else if (imageBuffer) {
     hash_largo = generarSha256(imageBuffer);
-    console.log(`[Worker Descarga] 🟢 SHA-256 calculado desde el Buffer descargado: ${hash_largo}`);
+    console.log(`[Worker Descarga] 🟢 SHA-256 desde Buffer: ${hash_largo}`);
   } else {
     const keyId = key.id || `msg_${Date.now()}`;
     hash_largo = generarSha256(null, keyId);
-    console.log(`[Worker Descarga] ⚠️ Fallback activo: SHA-256 generado desde key.id (${hash_largo})`);
+    console.log(`[Worker Descarga] ⚠️ SHA-256 Fallback (key.id): ${hash_largo}`);
   }
 
   const hash_corto = hash_largo.slice(-8);
@@ -94,7 +87,7 @@ const downloadWorker = new Worker('cola-descarga-media', async (job) => {
     }
   }
 
-  // 4. Armar Payload unificado para el Validador
+  // 4. Encaminar al Validador
   const payloadValidador = {
     hash_largo,
     hash_corto,
@@ -106,16 +99,16 @@ const downloadWorker = new Worker('cola-descarga-media', async (job) => {
     caption: imageMsg?.caption || message.conversation || body.caption || '',
     timestamp_msg: Number(data.messageTimestamp || body.timestamp_msg || Math.floor(Date.now() / 1000)),
     es_imagen: Boolean(imageBuffer || es_imagen),
-    instancia,
+    instancia: instancia || instanceId || 'desconocida',
     payload_raw: rawPayload
   };
 
   await validadorQueue.add('validar-evento', payloadValidador);
-  console.log(`[Worker Descarga] 🚀 Evento encolado en "cola-validador". SHA-256: ${hash_largo}`);
+  console.log(`[Worker Descarga] 🚀 Enviado a "cola-validador". SHA-256: ${hash_largo}`);
 
 }, {
   connection: redisConfig,
-  concurrency: 3
+  concurrency: 5
 });
 
 downloadWorker.on('failed', (job, err) => {
