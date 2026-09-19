@@ -42,9 +42,8 @@ const downloadWorker = new Worker('cola-descarga-media', async (job) => {
   // 1. Descargar imagen desde Evolution API usando resolutor multitenant
   if (es_imagen && key.id) {
     console.log(`[Worker Descarga] 🔄 Pidiendo imagen a Evolution API (Tenant: "${instancia || instanceId}")...`);
-    imageBuffer = await obtenerBufferImagen(instancia, instanceId, key);
+    imageBuffer = await obtenerBufferImagen(instancia, instanceId, key, message);
   }
-
   // 2. Resolver SHA-256 (Prioridad: WhatsApp Nativo > Buffer > Fallback)
   const shaNativoWhatsApp = extraerSha256Nativo(imageMsg?.fileSha256);
   let hash_largo = null;
