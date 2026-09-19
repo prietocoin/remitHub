@@ -66,7 +66,7 @@ app.get('/api/comprobantes', async (req, res) => {
       SELECT 
         r.hash_largo,
         r.estado,
-        COALESCE(c.url_r2, r.url_r2, r.url_imagen, r.key_r2) as url_raw_db,
+        COALESCE(c.url_r2, r.url_imagen, r.key_r2) as url_raw_db,
         r.timestamp_msg,
         r.nombre_push,
         r.usuario_raw,
