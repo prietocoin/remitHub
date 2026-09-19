@@ -1,20 +1,21 @@
 const axios = require('axios');
 
-async function obtenerBufferImagen(instancia, instanceId, key) {
+async function obtenerBufferImagen(instancia, instanceId, key, message) {
   const baseUrl = process.env.EVOLUTION_API_URL;
   const apiKey = process.env.AUTHENTICATION_API_KEY || process.env.EVOLUTION_API_KEY;
 
   if (!baseUrl) {
-    console.error('[Evolution Service] ❌ EVOLUTION_API_URL no configurada en entorno');
+    console.error('[Evolution Service] ❌ EVOLUTION_API_URL no configurada');
     return null;
   }
 
   const cleanBaseUrl = baseUrl.replace(/\/$/, '');
   
-  // Payload simplificado y estricto que requiere Evolution API
+  // Requerido: key + message (contiene mediaKey y directPath para desencriptar al vuelo)
   const payload = {
     message: {
-      key: key
+      key: key,
+      message: message
     },
     convertToMp4: false
   };
@@ -24,7 +25,6 @@ async function obtenerBufferImagen(instancia, instanceId, key) {
     'Content-Type': 'application/json'
   };
 
-  // Intentar primero con el identificador primario (instance name)
   let target = instancia || instanceId;
   let url = `${cleanBaseUrl}/message/getBase64FromMediaMessage/${target}`;
 
@@ -37,9 +37,8 @@ async function obtenerBufferImagen(instancia, instanceId, key) {
       return Buffer.from(cleanBase64, 'base64');
     }
   } catch (err) {
-    // Si falla con 404 y tenemos un instanceId alternativo (UUID), intentamos la segunda vía
     if (err.response?.status === 404 && instanceId && target !== instanceId) {
-      console.warn(`[Evolution Service ⚠️] 404 con instancia "${target}". Reintentando con instanceId UUID "${instanceId}"...`);
+      console.warn(`[Evolution Service ⚠️] 404 con "${target}". Reintentando con UUID "${instanceId}"...`);
       try {
         const fallbackUrl = `${cleanBaseUrl}/message/getBase64FromMediaMessage/${instanceId}`;
         const responseFallback = await axios.post(fallbackUrl, payload, { headers, timeout: 15000 });
@@ -50,7 +49,7 @@ async function obtenerBufferImagen(instancia, instanceId, key) {
           return Buffer.from(cleanBase64, 'base64');
         }
       } catch (fallbackErr) {
-        console.error(`[Evolution Service ERROR] Fallaron ambos identificadores para multitenant (${instancia} / ${instanceId}):`, fallbackErr.message);
+        console.error(`[Evolution Service ERROR] Fallaron ambos identificadores multitenant (${instancia} / ${instanceId}):`, fallbackErr.message);
       }
     } else {
       console.error(`[Evolution Service ERROR] HTTP ${err.response?.status || '500'} (${target}):`, err.response?.data?.message || err.message);
