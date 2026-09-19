@@ -51,11 +51,9 @@ async function llamarGeminiConFallback(prompt, mimeType, imageBase64) {
     throw new Error('No hay llaves de API de Gemini configuradas en GEMINI_KEYS o GEMINI_API_KEY');
   }
 
-  // Prioridad 1: GEMINI_MODEL de variables o gemini-3.5-flash-lite exacto de tu n8n
   const modelosCandidatos = [
     process.env.GEMINI_MODEL,
     'gemini-3.5-flash-lite',
-    'gemini-3.5-flash',
     'gemini-1.5-flash',
     'gemini-2.0-flash'
   ].filter(Boolean);
@@ -67,7 +65,6 @@ async function llamarGeminiConFallback(prompt, mimeType, imageBase64) {
     const activeKey = getNextActiveKey();
 
     for (const rawModel of modelosCandidatos) {
-      // Limpia el prefijo "models/" si viene definido en las variables de entorno
       const cleanModel = rawModel.replace(/^models\//, '');
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${cleanModel}:generateContent?key=${activeKey}`;
 
@@ -87,8 +84,9 @@ async function llamarGeminiConFallback(prompt, mimeType, imageBase64) {
         ultimoError = err;
         const status = err.response?.status;
         const apiErrorMsg = err.response?.data?.error?.message || err.message;
+        const statusLabel = status ? status : 'Err';
 
-        console.warn(`[Extractor LLM ⚠️] Modelo "${cleanModel}" falló (HTTP ${status \vert{}\vert{} 'Err'}):${apiErrorMsg}`);
+        console.warn(`[Extractor LLM ⚠️] Modelo "${cleanModel}" falló (HTTP ${statusLabel}):${apiErrorMsg}`);
 
         if (status === 404) {
           continue;
@@ -104,14 +102,13 @@ async function llamarGeminiConFallback(prompt, mimeType, imageBase64) {
 // 3. Worker: Motor de Inferencia IA
 const worker = new Worker('cola-extractor', async (job) => {
   const { hash_largo, instancia, key_r2, caption } = job.data;
-  console.log(`[Extractor] 🧠 Iniciando análisis de comprobante con Gemini 3.5 Flash Lite para Hash: ${hash_largo}`);
+  console.log(`[Extractor] 🧠 Iniciando análisis de comprobante con Gemini para Hash: ${hash_largo}`);
 
   try {
     if (!key_r2) {
       throw new Error(`key_r2 vino nula/indefinida para el Hash ${hash_largo}. Imposible consultar Cloudflare R2.`);
     }
 
-    // A. Descargar imagen desde Cloudflare R2
     console.log(`[Extractor] ☁️ Obteniendo objeto R2: ${key_r2}`);
     const command = new GetObjectCommand({
       Bucket: process.env.R2_BUCKET_NAME || 'remesas-img',
@@ -123,7 +120,6 @@ const worker = new Worker('cola-extractor', async (job) => {
     const imageBase64 = Buffer.from(byteArray).toString('base64');
     const mimeType = s3Response.ContentType || 'image/jpeg';
 
-    // B. Prompt quirúrgico idéntico al nodo de n8n
     const prompt = `Eres un sistema quirúrgico experto en auditoría y extracción de datos financieros. Tu salida debe ser ÚNICAMENTE un objeto JSON válido, sin bloques de código (\`\`\`json) ni texto adicional.
 ${caption ? `Caption adjunto al mensaje: "${caption}"` : ''}
 
@@ -136,14 +132,12 @@ Extrae los campos de este comprobante de pago o transferencia con este formato e
   "titular": string o null
 }`;
 
-    // C. Consultar API de Gemini
     const aiResponseData = await llamarGeminiConFallback(prompt, mimeType, imageBase64);
     const textResult = aiResponseData?.candidates?.[0]?.content?.parts?.[0]?.text;
     const datos_ia = parsearJSONSeguro(textResult);
 
     console.log(`[Extractor] ✨ Inferencia completada para Hash ${hash_largo}:`, JSON.stringify(datos_ia));
 
-    // D. Encolar resultado para el Ensamblador
     await colaEnsamblador.add('ensamblar-datos', {
       hash_largo,
       instancia: instancia || 'JAIRO',
