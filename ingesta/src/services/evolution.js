@@ -10,22 +10,31 @@ async function obtenerBufferImagen(instancia, key, message) {
   }
 
   try {
-    const url = `${baseUrl.replace(/\/$/, '')}/message/getBase64FromMediaMessage/${instancia}`;
+    const cleanBaseUrl = baseUrl.replace(/\/$/, '');
+    const url = `${cleanBaseUrl}/message/getBase64FromMediaMessage/${instancia}`;
+
     const response = await axios.post(url, {
-      message: { key, message }
+      message: {
+        key: key,
+        message: message
+      }
     }, {
-      headers: { 'apikey': apiKey, 'Content-Type': 'application/json' },
-      timeout: 12000
+      headers: {
+        'apikey': apiKey,
+        'Content-Type': 'application/json'
+      },
+      timeout: 15000
     });
 
     const base64Data = response.data?.base64 || response.data?.media;
     if (typeof base64Data === 'string') {
       const cleanBase64 = base64Data.replace(/^data:image\/\w+;base64,/, '');
       return Buffer.from(cleanBase64, 'base64');
+    } else {
+      console.error('[Evolution Service ⚠️] Respuesta sin Base64:', JSON.stringify(response.data));
     }
   } catch (err) {
-    console.error(`[Evolution Service ERROR] Falló descarga de media (${instancia}):`, err.message);
-    throw err; // Re-lanzar para que BullMQ active el reintento automático
+    console.error(`[Evolution Service ERROR] HTTP ${err.response?.status || '500'} (${instancia}):`, err.message);
   }
 
   return null;
