@@ -20,10 +20,9 @@ const s3Client = new S3Client({
   },
 });
 
-// Cola de salida hacia el Ensamblador
 const colaEnsamblador = new Queue('cola-ensamblador', { connection: redisConnection });
 
-// 2. Gestión de llaves Gemini: Pool dinámico y rotación activa
+// 2. Gestión de llaves Gemini
 const rawKeys = process.env.GEMINI_KEYS || process.env.GEMINI_API_KEY || '';
 const geminiKeyList = rawKeys.split(',').map(k => k.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
 let currentKeyIndex = 0;
@@ -46,19 +45,19 @@ function parsearJSONSeguro(texto) {
   }
 }
 
-// Función auxiliar para llamar a Gemini con fallback de modelos, endpoints y llaves
+// Función con soporte prioritario para gemini-3.5-flash-lite
 async function llamarGeminiConFallback(prompt, mimeType, imageBase64) {
   if (geminiKeyList.length === 0) {
     throw new Error('No hay llaves de API de Gemini configuradas en GEMINI_KEYS o GEMINI_API_KEY');
   }
 
-  // Modelos candidatos para evitar fallos de ruta (404)
+  // Prioridad 1: GEMINI_MODEL de variables o gemini-3.5-flash-lite exacto de tu n8n
   const modelosCandidatos = [
     process.env.GEMINI_MODEL,
+    'gemini-3.5-flash-lite',
+    'gemini-3.5-flash',
     'gemini-1.5-flash',
-    'gemini-2.0-flash',
-    'gemini-2.5-flash',
-    'gemini-1.5-flash-latest'
+    'gemini-2.0-flash'
   ].filter(Boolean);
 
   let ultimoError = null;
@@ -67,47 +66,47 @@ async function llamarGeminiConFallback(prompt, mimeType, imageBase64) {
   for (let intentoKey = 0; intentoKey < maxIntentosKeys; intentoKey++) {
     const activeKey = getNextActiveKey();
 
-    for (const model of modelosCandidatos) {
-      const urlsToTry = [
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${activeKey}`,
-        `https://generativelanguage.googleapis.com/v1/models/${model}:generateContent?key=${activeKey}`
-      ];
+    for (const rawModel of modelosCandidatos) {
+      // Limpia el prefijo "models/" si viene definido en las variables de entorno
+      const cleanModel = rawModel.replace(/^models\//, '');
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${cleanModel}:generateContent?key=${activeKey}`;
 
-      for (const url of urlsToTry) {
-        try {
-          const response = await axios.post(url, {
-            contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: mimeType, data: imageBase64 } }] }],
-            generationConfig: { response_mime_type: "application/json" }
-          }, { timeout: 35000 });
+      try {
+        const response = await axios.post(url, {
+          contents: [{
+            parts: [
+              { text: prompt },
+              { inline_data: { mime_type: mimeType, data: imageBase64 } }
+            ]
+          }],
+          generationConfig: { responseMimeType: "application/json" }
+        }, { timeout: 35000 });
 
-          return response.data;
-        } catch (err) {
-          ultimoError = err;
-          const status = err.response?.status;
+        return response.data;
+      } catch (err) {
+        ultimoError = err;
+        const status = err.response?.status;
+        const apiErrorMsg = err.response?.data?.error?.message || err.message;
 
-          // Si el endpoint o modelo da 404, prueba la siguiente variante de URL/Modelo
-          if (status === 404) {
-            continue;
-          }
+        console.warn(`[Extractor LLM ⚠️] Modelo "${cleanModel}" falló (HTTP ${status \vert{}\vert{} 'Err'}):${apiErrorMsg}`);
 
-          // Si es error de cuota (429), auth (401/403) o servidor (5xx), rotamos la llave
-          console.warn(`[Extractor LLM] Falló la llave en intento ${intentoKey + 1}/${maxIntentosKeys} (Status HTTP ${status || 'Unknown'}). Rotando llave...`);
-          break;
+        if (status === 404) {
+          continue;
         }
+        break;
       }
     }
   }
 
-  throw new Error(`Exhaustos todos los reintentos de llaves/modelos Gemini: ${ultimoError?.response?.data?.error?.message || ultimoError?.message}`);
+  throw new Error(`Exhaustos todos los reintentos de Gemini: ${ultimoError?.response?.data?.error?.message || ultimoError?.message}`);
 }
 
 // 3. Worker: Motor de Inferencia IA
 const worker = new Worker('cola-extractor', async (job) => {
   const { hash_largo, instancia, key_r2, caption } = job.data;
-  console.log(`[Extractor] 🧠 Iniciando análisis de comprobante con IA para Hash: ${hash_largo}`);
+  console.log(`[Extractor] 🧠 Iniciando análisis de comprobante con Gemini 3.5 Flash Lite para Hash: ${hash_largo}`);
 
   try {
-    // Guardia contra peticiones sin imagen en R2
     if (!key_r2) {
       throw new Error(`key_r2 vino nula/indefinida para el Hash ${hash_largo}. Imposible consultar Cloudflare R2.`);
     }
@@ -124,11 +123,11 @@ const worker = new Worker('cola-extractor', async (job) => {
     const imageBase64 = Buffer.from(byteArray).toString('base64');
     const mimeType = s3Response.ContentType || 'image/jpeg';
 
-    // B. Preparar prompt
-    const prompt = `Analiza este comprobante de pago o transferencia.
-${caption ? `Texto/Caption adjunto al mensaje: "${caption}"` : ''}
+    // B. Prompt quirúrgico idéntico al nodo de n8n
+    const prompt = `Eres un sistema quirúrgico experto en auditoría y extracción de datos financieros. Tu salida debe ser ÚNICAMENTE un objeto JSON válido, sin bloques de código (\`\`\`json) ni texto adicional.
+${caption ? `Caption adjunto al mensaje: "${caption}"` : ''}
 
-Extrae estrictamente un objeto JSON con el siguiente formato exacto:
+Extrae los campos de este comprobante de pago o transferencia con este formato exacto:
 {
   "monto": number o null,
   "moneda": string o null (ej. "USD", "VES", "PEN", "EUR", "CLP"),
@@ -137,7 +136,7 @@ Extrae estrictamente un objeto JSON con el siguiente formato exacto:
   "titular": string o null
 }`;
 
-    // C. Consultar API de Gemini con rotación y fallback
+    // C. Consultar API de Gemini
     const aiResponseData = await llamarGeminiConFallback(prompt, mimeType, imageBase64);
     const textResult = aiResponseData?.candidates?.[0]?.content?.parts?.[0]?.text;
     const datos_ia = parsearJSONSeguro(textResult);
@@ -159,7 +158,6 @@ Extrae estrictamente un objeto JSON con el siguiente formato exacto:
   }
 }, { connection: redisConnection, concurrency: 3 });
 
-// Escuchadores de eventos para la consola
 worker.on('completed', (job) => {
   console.log(`[Extractor Evento] 🎉 Trabajo ${job.id} procesado con éxito.`);
 });
