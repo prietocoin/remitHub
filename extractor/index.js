@@ -9,7 +9,6 @@ const redisConnection = new Redis({
   port: process.env.REDIS_PORT || 6379,
 });
 
-// 2. Cliente S3 para Cloudflare R2
 const s3Client = new S3Client({
   region: 'auto',
   endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
@@ -19,22 +18,19 @@ const s3Client = new S3Client({
   },
 });
 
-// 3. Cola de destino (Siguiente módulo)
 const colaEnsamblador = new Queue('cola-ensamblador', { connection: redisConnection });
 
-// 4. Gestión rotativa de claves Gemini
+// 2. Gestión de llaves: Rotación Preventiva (Round-Robin)
 const rawKeys = process.env.GEMINI_KEYS || process.env.GEMINI_API_KEY || '';
 const geminiKeyList = rawKeys.split(',').map(k => k.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
 let currentKeyIndex = 0;
 
-function getActiveKey() {
-  return geminiKeyList[currentKeyIndex % geminiKeyList.length] || '';
-}
-
-function rotateKey() {
-  if (geminiKeyList.length > 1) {
-    currentKeyIndex = (currentKeyIndex + 1) % geminiKeyList.length;
-  }
+// NUEVA LÓGICA: Obtiene la llave actual y rota el índice inmediatamente para el siguiente uso
+function getNextActiveKey() {
+  if (geminiKeyList.length === 0) return '';
+  const key = geminiKeyList[currentKeyIndex % geminiKeyList.length];
+  currentKeyIndex = (currentKeyIndex + 1) % geminiKeyList.length; 
+  return key;
 }
 
 function parsearJSONSeguro(texto) {
@@ -47,13 +43,12 @@ function parsearJSONSeguro(texto) {
   }
 }
 
-// 5. Worker: Motor de Inferencia IA (Cero Base de Datos)
+// 3. Worker: Motor de Inferencia IA
 const worker = new Worker('cola-extractor', async (job) => {
   const { hash_largo, instancia, key_r2 } = job.data;
   console.log(`[Extractor] Iniciando análisis IA para: ${hash_largo}`);
 
   try {
-    // A. Descarga directa y privada desde R2
     const command = new GetObjectCommand({
       Bucket: process.env.R2_BUCKET_NAME || 'remesas-img',
       Key: key_r2,
@@ -63,9 +58,10 @@ const worker = new Worker('cola-extractor', async (job) => {
     const imageBase64 = Buffer.from(byteArray).toString('base64');
     const mimeType = s3Response.ContentType || 'image/jpeg';
 
-    // B. Inferencia con Gemini AI
-    const activeKey = getActiveKey();
+    // Se asigna la llave y ya queda rotada para la próxima imagen
+    const activeKey = getNextActiveKey();
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${activeKey}`;
+    
     const prompt = `Analiza este comprobante de pago o transferencia y extrae estrictamente un objeto JSON:
     {
       "monto": number o null,
@@ -83,25 +79,18 @@ const worker = new Worker('cola-extractor', async (job) => {
     const textResult = aiResponse.data?.candidates?.[0]?.content?.parts?.[0]?.text;
     const datos_ia = parsearJSONSeguro(textResult);
 
-    // C. Empujar resultado limpio al Ensamblador
     await colaEnsamblador.add('ensamblar-datos', {
       hash_largo,
       instancia,
       datos_ia
-    }, { 
-      removeOnComplete: true,
-      attempts: 3,
-      backoff: { type: 'exponential', delay: 2000 }
-    });
+    }, { removeOnComplete: true });
 
     console.log(`[Extractor] Inferencia exitosa. JSON encolado para: ${hash_largo}`);
 
   } catch (error) {
-    rotateKey(); // Rota la llave de IA ante cualquier error de red o cuota (429)
     console.error(`[Extractor Error] Falló ${hash_largo}:`, error.response?.data?.error?.message || error.message);
-    // Lanza el error para que BullMQ lo atrape y aplique los reintentos automáticos
     throw error; 
   }
-}, { connection: redisConnection, concurrency: 3 }); // Concurrencia limitada para no saturar Gemini
+}, { connection: redisConnection, concurrency: 3 });
 
-console.log('[Extractor] Worker iniciado, esperando imágenes en cola-extractor...');
+console.log('[Extractor] Worker iniciado con rotación preventiva de llaves...');
