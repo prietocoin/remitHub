@@ -13,6 +13,33 @@ const app = express();
 app.use(express.json());
 const PORT = process.env.PORT || 3000;
 
+// Función para reparar y construir URLs públicas válidas de R2 al vuelo
+function resolverUrlImagen(rawPathOrUrl) {
+  if (!rawPathOrUrl) return null;
+  
+  const r2Domain = (process.env.R2_PUBLIC_DOMAIN || '').replace(/\/$/, '');
+
+  // 1. Extraer la ruta de la llave R2 (ej: "comprobantes/9AC9F...jpg")
+  const keyMatch = rawPathOrUrl.match(/comprobantes\/[^\s"']+/);
+  
+  if (keyMatch && r2Domain) {
+    return `${r2Domain}/${keyMatch[0]}`;
+  }
+
+  // 2. Si ya es una URL válida y no tiene dominios erróneos
+  if (rawPathOrUrl.startsWith('http') && !rawPathOrUrl.includes('pub-xxxx') && !rawPathOrUrl.includes('automat-panel')) {
+    return rawPathOrUrl;
+  }
+
+  // 3. Fallback con r2Domain limpiando el host previo
+  if (r2Domain) {
+    const cleanKey = rawPathOrUrl.replace(/^https?:\/\/[^\/]+\//, '');
+    return `${r2Domain}/${cleanKey}`;
+  }
+
+  return rawPathOrUrl;
+}
+
 // 1. ENDPOINTS API
 
 // Obtener la lista de todas las instancias activas
@@ -30,7 +57,7 @@ app.get('/api/instancias', async (req, res) => {
   }
 });
 
-// Obtener comprobantes cruzando los datos crudos con los resultados de la IA
+// Obtener comprobantes procesando dinámicamente las URLs de R2
 app.get('/api/comprobantes', async (req, res) => {
   try {
     const instanciaTarget = req.query.instancia || 'JAIRO';
@@ -39,7 +66,7 @@ app.get('/api/comprobantes', async (req, res) => {
       SELECT 
         r.hash_largo,
         r.estado,
-        COALESCE(c.url_r2, r.url_imagen) as url_imagen, -- Prioriza la URL segura de R2
+        COALESCE(c.url_r2, r.url_r2, r.url_imagen, r.key_r2) as url_raw_db,
         r.timestamp_msg,
         r.nombre_push,
         r.usuario_raw,
@@ -59,13 +86,20 @@ app.get('/api/comprobantes', async (req, res) => {
       LIMIT 60
     `;
     const { rows } = await pool.query(query, [instanciaTarget]);
-    res.json(rows);
+
+    // Sanitizar y reparar cada URL antes de enviarla al frontend
+    const itemsFormateados = rows.map(row => ({
+      ...row,
+      url_imagen: resolverUrlImagen(row.url_raw_db)
+    }));
+
+    res.json(itemsFormateados);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Descarte lógico (Soft-Delete) para mantener la inmutabilidad
+// Descarte lógico (Soft-Delete)
 app.delete('/api/comprobantes/:hash', async (req, res) => {
   const { hash } = req.params;
   try {
@@ -192,10 +226,9 @@ app.get('/', (req, res) => {
 
           let imgHTML = '<div class="w-full h-full flex items-center justify-center text-[10px] text-slate-600 font-mono text-center px-2">Sin Imagen<br>(Esperando 2x)</div>';
           if (item.url_imagen) {
-            imgHTML = \`<img src="\${item.url_imagen}" class="w-full h-full object-cover cursor-pointer hover:scale-105 transition" onclick="window.open(this.src)" title="Click para expandir"/>\`;
+            imgHTML = \`<img src="\${item.url_imagen}" class="w-full h-full object-cover cursor-pointer hover:scale-105 transition" onclick="window.open(this.src)" title="Click para expandir" onerror="this.onerror=null; this.parentElement.innerHTML='<div class=\\'w-full h-full flex items-center justify-center text-[9px] text-rose-400 font-mono text-center px-1\\'>Error de Carga R2</div>';"/>\`;
           }
 
-          // Inyección de la lectura de IA si existe
           let extraccionIA = '';
           if (item.monto || item.banco) {
             extraccionIA = \`
@@ -256,7 +289,7 @@ app.get('/', (req, res) => {
 
     cargarInstancias();
     cargar();
-    setInterval(cargar, 5000); // Polling cada 5s
+    setInterval(cargar, 5000);
   </script>
 </body>
 </html>
