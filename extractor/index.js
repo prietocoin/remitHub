@@ -46,62 +46,96 @@ function parsearJSONSeguro(texto) {
   }
 }
 
-// Función auxiliar para llamar a Gemini probando las llaves disponibles
+// Función auxiliar para llamar a Gemini con fallback de modelos, endpoints y llaves
 async function llamarGeminiConFallback(prompt, mimeType, imageBase64) {
   if (geminiKeyList.length === 0) {
     throw new Error('No hay llaves de API de Gemini configuradas en GEMINI_KEYS o GEMINI_API_KEY');
   }
 
+  // Modelos candidatos para evitar fallos de ruta (404)
+  const modelosCandidatos = [
+    process.env.GEMINI_MODEL,
+    'gemini-1.5-flash',
+    'gemini-2.0-flash',
+    'gemini-2.5-flash',
+    'gemini-1.5-flash-latest'
+  ].filter(Boolean);
+
   let ultimoError = null;
-  const maxIntentos = Math.min(geminiKeyList.length, 3); // Probar hasta 3 llaves distintas
+  const maxIntentosKeys = Math.min(geminiKeyList.length, 3);
 
-  for (let intento = 0; intento < maxIntentos; intento++) {
+  for (let intentoKey = 0; intentoKey < maxIntentosKeys; intentoKey++) {
     const activeKey = getNextActiveKey();
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${activeKey}`;
 
-    try {
-      const response = await axios.post(url, {
-        contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: mimeType, data: imageBase64 } }] }],
-        generationConfig: { response_mime_type: "application/json" }
-      }, { timeout: 35000 });
+    for (const model of modelosCandidatos) {
+      const urlsToTry = [
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${activeKey}`,
+        `https://generativelanguage.googleapis.com/v1/models/${model}:generateContent?key=${activeKey}`
+      ];
 
-      return response.data;
-    } catch (err) {
-      ultimoError = err;
-      const status = err.response?.status;
-      console.warn(`[Extractor LLM] Falló la llave en intento ${intento + 1}/${maxIntentos} (Status HTTP ${status || 'Unknown'}). Reintentando con siguiente llave...`);
+      for (const url of urlsToTry) {
+        try {
+          const response = await axios.post(url, {
+            contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: mimeType, data: imageBase64 } }] }],
+            generationConfig: { response_mime_type: "application/json" }
+          }, { timeout: 35000 });
+
+          return response.data;
+        } catch (err) {
+          ultimoError = err;
+          const status = err.response?.status;
+
+          // Si el endpoint o modelo da 404, prueba la siguiente variante de URL/Modelo
+          if (status === 404) {
+            continue;
+          }
+
+          // Si es error de cuota (429), auth (401/403) o servidor (5xx), rotamos la llave
+          console.warn(`[Extractor LLM] Falló la llave en intento ${intentoKey + 1}/${maxIntentosKeys} (Status HTTP ${status || 'Unknown'}). Rotando llave...`);
+          break;
+        }
+      }
     }
   }
 
-  throw new Error(`Exhaustos todos los reintentos de llaves Gemini: ${ultimoError?.response?.data?.error?.message || ultimoError?.message}`);
+  throw new Error(`Exhaustos todos los reintentos de llaves/modelos Gemini: ${ultimoError?.response?.data?.error?.message || ultimoError?.message}`);
 }
 
 // 3. Worker: Motor de Inferencia IA
 const worker = new Worker('cola-extractor', async (job) => {
-  const { hash_largo, instancia, key_r2 } = job.data;
+  const { hash_largo, instancia, key_r2, caption } = job.data;
   console.log(`[Extractor] 🧠 Iniciando análisis de comprobante con IA para Hash: ${hash_largo}`);
 
   try {
+    // Guardia contra peticiones sin imagen en R2
+    if (!key_r2) {
+      throw new Error(`key_r2 vino nula/indefinida para el Hash ${hash_largo}. Imposible consultar Cloudflare R2.`);
+    }
+
     // A. Descargar imagen desde Cloudflare R2
     console.log(`[Extractor] ☁️ Obteniendo objeto R2: ${key_r2}`);
     const command = new GetObjectCommand({
       Bucket: process.env.R2_BUCKET_NAME || 'remesas-img',
       Key: key_r2,
     });
+    
     const s3Response = await s3Client.send(command);
     const byteArray = await s3Response.Body.transformToByteArray();
     const imageBase64 = Buffer.from(byteArray).toString('base64');
     const mimeType = s3Response.ContentType || 'image/jpeg';
 
     // B. Preparar prompt
-    const prompt = `Analiza este comprobante de pago o transferencia y extrae estrictamente un objeto JSON:
-    {
-      "monto": number o null,
-      "moneda": string o null (ej. "USD", "VES", "PEN", "EUR", "CLP"),
-      "banco": string o null,
-      "referencia": string o null,
-      "titular": string o null
-    }`;
+    const prompt = `Analiza este comprobante de pago o transferencia.
+${caption ? `Texto/Caption adjunto al mensaje: "${caption}"` : ''}
+
+Extrae estrictamente un objeto JSON con el siguiente formato exacto:
+{
+  "monto": number o null,
+  "moneda": string o null (ej. "USD", "VES", "PEN", "EUR", "CLP"),
+  "banco": string o null,
+  "referencia": string o null,
+  "titular": string o null
+}`;
 
     // C. Consultar API de Gemini con rotación y fallback
     const aiResponseData = await llamarGeminiConFallback(prompt, mimeType, imageBase64);
