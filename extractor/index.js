@@ -3,10 +3,11 @@ const Redis = require('ioredis');
 const axios = require('axios');
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 
-// 1. Conexión exclusiva a Redis
 const redisConnection = new Redis({
   host: process.env.REDIS_HOST || '127.0.0.1',
-  port: process.env.REDIS_PORT || 6379,
+  port: Number(process.env.REDIS_PORT) || 6379,
+  password: process.env.REDIS_PASSWORD,
+  maxRetriesPerRequest: null,
 });
 
 const s3Client = new S3Client({
