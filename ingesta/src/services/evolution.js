@@ -10,8 +10,25 @@ async function obtenerBufferImagen(instancia, instanceId, key, message) {
   }
 
   const cleanBaseUrl = baseUrl.replace(/\/$/, '');
-  
-  // Requerido: key + message (contiene mediaKey y directPath para desencriptar al vuelo)
+  const target = instancia || instanceId;
+
+  if (!target) {
+    console.error('[Evolution Service ⚠️] Petición cancelada: No se proporcionó instancia ni instanceId');
+    return null;
+  }
+
+  // Candidatos de endpoints (Soporte v1 y v2 de Evolution API)
+  const endpoints = [
+    `${cleanBaseUrl}/message/getBase64FromMediaMessage/${target}`,
+    `${cleanBaseUrl}/chat/getBase64FromMediaMessage/${target}`,
+  ];
+
+  // Si tenemos UUID alternativo, agregamos sus candidatos como respaldo
+  if (instanceId && target !== instanceId) {
+    endpoints.push(`${cleanBaseUrl}/message/getBase64FromMediaMessage/${instanceId}`);
+    endpoints.push(`${cleanBaseUrl}/chat/getBase64FromMediaMessage/${instanceId}`);
+  }
+
   const payload = {
     message: {
       key: key,
@@ -25,37 +42,26 @@ async function obtenerBufferImagen(instancia, instanceId, key, message) {
     'Content-Type': 'application/json'
   };
 
-  let target = instancia || instanceId;
-  let url = `${cleanBaseUrl}/message/getBase64FromMediaMessage/${target}`;
+  for (const url of endpoints) {
+    try {
+      const response = await axios.post(url, payload, { headers, timeout: 12000 });
+      const base64Data = response.data?.base64 || response.data?.media;
 
-  try {
-    const response = await axios.post(url, payload, { headers, timeout: 15000 });
-    const base64Data = response.data?.base64 || response.data?.media;
-    
-    if (typeof base64Data === 'string') {
-      const cleanBase64 = base64Data.replace(/^data:image\/\w+;base64,/, '');
-      return Buffer.from(cleanBase64, 'base64');
-    }
-  } catch (err) {
-    if (err.response?.status === 404 && instanceId && target !== instanceId) {
-      console.warn(`[Evolution Service ⚠️] 404 con "${target}". Reintentando con UUID "${instanceId}"...`);
-      try {
-        const fallbackUrl = `${cleanBaseUrl}/message/getBase64FromMediaMessage/${instanceId}`;
-        const responseFallback = await axios.post(fallbackUrl, payload, { headers, timeout: 15000 });
-        const base64Data = responseFallback.data?.base64 || responseFallback.data?.media;
-        
-        if (typeof base64Data === 'string') {
-          const cleanBase64 = base64Data.replace(/^data:image\/\w+;base64,/, '');
-          return Buffer.from(cleanBase64, 'base64');
-        }
-      } catch (fallbackErr) {
-        console.error(`[Evolution Service ERROR] Fallaron ambos identificadores multitenant (${instancia} / ${instanceId}):`, fallbackErr.message);
+      if (typeof base64Data === 'string') {
+        const cleanBase64 = base64Data.replace(/^data:image\/\w+;base64,/, '');
+        return Buffer.from(cleanBase64, 'base64');
       }
-    } else {
-      console.error(`[Evolution Service ERROR] HTTP ${err.response?.status || '500'} (${target}):`, err.response?.data?.message || err.message);
+    } catch (err) {
+      // Si da 404, continúa silenciosamente al siguiente endpoint candidato
+      if (err.response?.status === 404) {
+        continue;
+      }
+      console.error(`[Evolution Service ERROR] HTTP ${err.response?.status || '500'} (${url}):`, err.response?.data?.message || err.message);
+      break;
     }
   }
 
+  console.error(`[Evolution Service ⚠️] No se pudo obtener Base64 para tenant "${target}" tras probar endpoints v1/v2.`);
   return null;
 }
 
