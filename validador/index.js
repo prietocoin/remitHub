@@ -15,7 +15,9 @@ const pool = new Pool({
 
 const redisConnection = new Redis({
   host: process.env.REDIS_HOST || '127.0.0.1',
-  port: process.env.REDIS_PORT || 6379,
+  port: Number(process.env.REDIS_PORT) || 6379,
+  password: process.env.REDIS_PASSWORD,
+  maxRetriesPerRequest: null,
 });
 
 const s3Client = new S3Client({
