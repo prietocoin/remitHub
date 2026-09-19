@@ -14,30 +14,34 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 
 // Función para reparar y construir URLs públicas válidas de R2 al vuelo
-function resolverUrlImagen(rawPathOrUrl) {
-  if (!rawPathOrUrl) return null;
-  
+function resolverUrlImagen(rawPathOrUrl, hashLargo) {
   const r2Domain = (process.env.R2_PUBLIC_DOMAIN || '').replace(/\/$/, '');
 
-  // 1. Extraer la ruta de la llave R2 (ej: "comprobantes/9AC9F...jpg")
-  const keyMatch = rawPathOrUrl.match(/comprobantes\/[^\s"']+/);
-  
-  if (keyMatch && r2Domain) {
-    return `${r2Domain}/${keyMatch[0]}`;
+  if (rawPathOrUrl) {
+    // 1. Extraer la ruta de la llave R2 si viene parcial (ej: "comprobantes/9AC9F...jpg")
+    const keyMatch = rawPathOrUrl.match(/comprobantes\/[^\s"']+/);
+    if (keyMatch && r2Domain) {
+      return `${r2Domain}/${keyMatch[0]}`;
+    }
+
+    // 2. Si ya es una URL válida y no tiene dominios erróneos
+    if (rawPathOrUrl.startsWith('http') && !rawPathOrUrl.includes('pub-xxxx') && !rawPathOrUrl.includes('automat-panel')) {
+      return rawPathOrUrl;
+    }
+
+    // 3. Limpiar host previo si existe
+    if (r2Domain) {
+      const cleanKey = rawPathOrUrl.replace(/^https?:\/\/[^\/]+\//, '');
+      return `${r2Domain}/${cleanKey}`;
+    }
   }
 
-  // 2. Si ya es una URL válida y no tiene dominios erróneos
-  if (rawPathOrUrl.startsWith('http') && !rawPathOrUrl.includes('pub-xxxx') && !rawPathOrUrl.includes('automat-panel')) {
-    return rawPathOrUrl;
+  // Fallback determinista usando la convención de almacenamiento de R2
+  if (r2Domain && hashLargo) {
+    return `${r2Domain}/comprobantes/${hashLargo}.jpg`;
   }
 
-  // 3. Fallback con r2Domain limpiando el host previo
-  if (r2Domain) {
-    const cleanKey = rawPathOrUrl.replace(/^https?:\/\/[^\/]+\//, '');
-    return `${r2Domain}/${cleanKey}`;
-  }
-
-  return rawPathOrUrl;
+  return rawPathOrUrl || null;
 }
 
 // 1. ENDPOINTS API
@@ -66,7 +70,7 @@ app.get('/api/comprobantes', async (req, res) => {
       SELECT 
         r.hash_largo,
         r.estado,
-        COALESCE(c.url_r2, r.url_imagen, r.key_r2) as url_raw_db,
+        COALESCE(c.url_r2, r.url_imagen) as url_raw_db,
         r.timestamp_msg,
         r.nombre_push,
         r.usuario_raw,
@@ -90,7 +94,7 @@ app.get('/api/comprobantes', async (req, res) => {
     // Sanitizar y reparar cada URL antes de enviarla al frontend
     const itemsFormateados = rows.map(row => ({
       ...row,
-      url_imagen: resolverUrlImagen(row.url_raw_db)
+      url_imagen: resolverUrlImagen(row.url_raw_db, row.hash_largo)
     }));
 
     res.json(itemsFormateados);
