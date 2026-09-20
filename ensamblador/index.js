@@ -1,39 +1,21 @@
-const { Worker, Queue } = require('bullmq');
-const Redis = require('ioredis');
-const { Pool } = require('pg');
+const { Worker } = require('bullmq');
+const pool = require('./src/config/db');
+const redisConfig = require('./src/config/redis');
+const colaDistribuidor = require('./src/queues/distribuidor.queue');
 
-// 1. Conexiones
-const pool = new Pool({
-  host: process.env.DB_HOST,
-  port: Number(process.env.DB_PORT) || 5432,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-});
-
-const redisConnection = new Redis({
-  host: process.env.REDIS_HOST || '127.0.0.1',
-  port: Number(process.env.REDIS_PORT) || 6379,
-  password: process.env.REDIS_PASSWORD || undefined,
-  maxRetriesPerRequest: null,
-});
-
-// 2. Cola de destino
-const colaDistribuidor = new Queue('cola-distribuidor', { connection: redisConnection });
-
-// 3. Worker: Ensamblador de Datos
 const worker = new Worker('cola-ensamblador', async (job) => {
   const { hash_largo, instancia, datos_ia } = job.data;
   const datos = datos_ia || {};
+  const hashCorto = hash_largo ? hash_largo.slice(-8) : 'DESCONOCIDO';
 
-  console.log(`[Ensamblador] 🧱 Asentando datos extraídos por IA para Hash: ${hash_largo}`);
+  console.log(`[Ensamblador] 🧱 Asentando datos extraídos por IA para Hash: ${hashCorto}`);
 
   const cliente = await pool.connect();
 
   try {
     await cliente.query('BEGIN');
 
-    // A. Actualiza la tabla de trabajo con los datos extraídos por la IA
+    // A. Actualiza la tabla operativa con los datos extraídos por la IA
     await cliente.query(`
       UPDATE comprobantes_raw SET 
         monto = $1, 
@@ -53,7 +35,7 @@ const worker = new Worker('cola-ensamblador', async (job) => {
       hash_largo
     ]);
 
-    // B. Cierra el ciclo en la tabla inmutable
+    // B. Cierra el ciclo en la tabla inmutable de auditoría
     await cliente.query(`
       UPDATE registros_raw 
       SET estado = 'PROCESADO' 
@@ -61,20 +43,20 @@ const worker = new Worker('cola-ensamblador', async (job) => {
     `, [hash_largo]);
 
     await cliente.query('COMMIT');
-    console.log(`[Ensamblador] 💾 PostgreSQL actualizado con éxito para Hash: ${hash_largo}`);
+    console.log(`[Ensamblador] 💾 PostgreSQL actualizado con éxito para Hash: ${hashCorto}`);
 
     // C. Empujar el paquete terminado al Distribuidor
     await colaDistribuidor.add('distribuir-evento', {
       hash_largo,
       instancia: instancia || 'JAIRO',
       datos_finales: datos
-    }, { removeOnComplete: true });
+    });
 
-    console.log(`[Ensamblador] 🚀 Comprobante ${hash_largo} transferido a "cola-distribuidor".`);
+    console.log(`[Ensamblador] 🚀 Comprobante ${hashCorto} transferido a "cola-distribuidor".`);
 
   } catch (error) {
     await cliente.query('ROLLBACK').catch(() => {});
-    console.error(`[Ensamblador ERROR] Falló el asentamiento para Hash ${hash_largo}:`, error.message);
+    console.error(`[Ensamblador ERROR] Falló el asentamiento para Hash ${hashCorto}:`, error.message);
     
     // Marcar estado de fallo en la base de datos
     await pool.query(`UPDATE registros_raw SET estado = 'FALLO' WHERE hash_largo = $1`, [hash_largo]).catch(() => {});
@@ -82,15 +64,18 @@ const worker = new Worker('cola-ensamblador', async (job) => {
   } finally {
     cliente.release();
   }
-}, { connection: redisConnection, concurrency: 10 });
+}, { 
+  connection: redisConfig, 
+  concurrency: 10 
+});
 
-// Escuchadores globales de eventos para la consola
+// Listener de eventos
 worker.on('completed', (job) => {
-  console.log(`[Ensamblador Evento] 🎉 Trabajo ${job.id} ensamblado y finalizado exitosamente.`);
+  console.log(`[Ensamblador Evento] 🎉 Job ${job.id} ensamblado y finalizado exitosamente.`);
 });
 
 worker.on('failed', (job, err) => {
-  console.error(`[Ensamblador Evento] ❌ Trabajo ${job?.id} falló:`, err.message);
+  console.error(`[Ensamblador Evento] ❌ Job ${job?.id} falló:`, err.message);
 });
 
 worker.on('error', (err) => {
