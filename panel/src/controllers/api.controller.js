@@ -3,9 +3,10 @@ const { resolverUrlImagen } = require('../utils/imageResolver');
 
 async function getInstancias(req, res) {
   try {
+    // Consulta directa a impactos_raw para reflejar instancias desde el primer webhook
     const { rows } = await pool.query(`
       SELECT DISTINCT LOWER(instancia) as instancia 
-      FROM registros_raw 
+      FROM impactos_raw 
       WHERE instancia IS NOT NULL AND instancia <> ''
       ORDER BY instancia ASC
     `);
@@ -47,13 +48,13 @@ async function getComprobantes(req, res) {
           MAX(instancia) as instancia,
           COUNT(*) as total_impactos,
           MAX(timestamp_msg) as timestamp_msg,
-          -- Impacto 1 (Primer mensaje real en impactos_raw)
+          -- Impacto 1 (Primer mensaje recibido)
           MAX(NULLIF(nombre_push, '')) FILTER (WHERE num_impacto = 1) as nombre_push_1,
           MAX(NULLIF(usuario_raw, '')) FILTER (WHERE num_impacto = 1) as usuario_raw_1,
           MAX(NULLIF(grupo_raw, '')) FILTER (WHERE num_impacto = 1) as grupo_raw_1,
           MAX(NULLIF(caption, '')) FILTER (WHERE num_impacto = 1) as caption_1,
           MAX(NULLIF(url_imagen, '')) FILTER (WHERE num_impacto = 1) as url_imagen_1,
-          -- Impacto 2 (Segundo mensaje real en impactos_raw)
+          -- Impacto 2 (Segundo mensaje recibido)
           MAX(NULLIF(nombre_push, '')) FILTER (WHERE num_impacto = 2) as nombre_push_2,
           MAX(NULLIF(usuario_raw, '')) FILTER (WHERE num_impacto = 2) as usuario_raw_2,
           MAX(NULLIF(grupo_raw, '')) FILTER (WHERE num_impacto = 2) as grupo_raw_2,
@@ -95,11 +96,21 @@ async function getComprobantes(req, res) {
 
     const { rows } = await pool.query(query, [instanciaTarget]);
 
-    const itemsFormateados = rows.map(row => ({
-      ...row,
-      url_imagen_1: resolverUrlImagen(row.url_imagen_1 || row.url_r2_comprobante, row.hash_largo),
-      url_imagen_2: row.url_imagen_2 ? resolverUrlImagen(row.url_imagen_2, row.hash_largo + '_2') : null
-    }));
+    const itemsFormateados = rows.map(row => {
+      const url1 = resolverUrlImagen(row.url_imagen_1 || row.url_r2_comprobante, row.hash_largo);
+      let url2 = row.url_imagen_2 ? resolverUrlImagen(row.url_imagen_2, row.hash_largo + '_2') : null;
+
+      // Deduplicación en backend: Si apunta a la misma imagen, se anula url2
+      if (url2 === url1) {
+        url2 = null;
+      }
+
+      return {
+        ...row,
+        url_imagen_1: url1,
+        url_imagen_2: url2
+      };
+    });
 
     res.json(itemsFormateados);
   } catch (err) {
