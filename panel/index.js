@@ -54,7 +54,7 @@ app.get('/api/instancias', async (req, res) => {
   }
 });
 
-// Consulta avanzada agrupando Impacto 1 e Impacto 2 por hash_largo
+// Consulta avanzada agrupando Impacto 1 e Impacto 2 sin requerir columna 'id'
 app.get('/api/comprobantes', async (req, res) => {
   try {
     const instanciaTarget = req.query.instancia || 'JAIRO';
@@ -69,7 +69,7 @@ app.get('/api/comprobantes', async (req, res) => {
       WITH ranked_raw AS (
         SELECT 
           *,
-          ROW_NUMBER() OVER (PARTITION BY hash_largo ORDER BY id ASC) as num_impacto
+          ROW_NUMBER() OVER (PARTITION BY hash_largo ORDER BY timestamp_msg ASC, ctid ASC) as num_impacto
         FROM registros_raw
         WHERE LOWER(instancia) = LOWER($1)
       ),
