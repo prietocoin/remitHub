@@ -62,7 +62,7 @@ async function extraerDatosConGemini(prompt, mimeType, imageBase64) {
       } catch (err) {
         ultimoError = err;
         const status = err.response?.status;
-        console.warn(`[Gemini Service ⚠️] Modelo "${cleanModel}" falló (HTTP ${status \vert{}\vert{} 'Err'}):${err.message}`);
+        console.warn(`[Gemini Service ⚠️] Modelo "${cleanModel}" falló (HTTP ${status || 'Err'}): ${err.message}`);
 
         if (status === 404) continue;
         break;
