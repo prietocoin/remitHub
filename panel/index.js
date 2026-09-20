@@ -13,30 +13,24 @@ const app = express();
 app.use(express.json());
 const PORT = process.env.PORT || 3000;
 
-// Función para reparar y construir URLs públicas válidas de R2 al vuelo
+// Resolver y sanitizar URLs de R2
 function resolverUrlImagen(rawPathOrUrl, hashLargo) {
   const r2Domain = (process.env.R2_PUBLIC_DOMAIN || '').replace(/\/$/, '');
 
   if (rawPathOrUrl) {
-    // 1. Extraer la ruta de la llave R2 si viene parcial (ej: "comprobantes/9AC9F...jpg")
     const keyMatch = rawPathOrUrl.match(/comprobantes\/[^\s"']+/);
     if (keyMatch && r2Domain) {
       return `${r2Domain}/${keyMatch[0]}`;
     }
-
-    // 2. Si ya es una URL válida y no tiene dominios erróneos
     if (rawPathOrUrl.startsWith('http') && !rawPathOrUrl.includes('pub-xxxx') && !rawPathOrUrl.includes('automat-panel')) {
       return rawPathOrUrl;
     }
-
-    // 3. Limpiar host previo si existe
     if (r2Domain) {
       const cleanKey = rawPathOrUrl.replace(/^https?:\/\/[^\/]+\//, '');
       return `${r2Domain}/${cleanKey}`;
     }
   }
 
-  // Fallback determinista usando la convención de almacenamiento de R2
   if (r2Domain && hashLargo) {
     return `${r2Domain}/comprobantes/${hashLargo}.jpg`;
   }
@@ -46,7 +40,6 @@ function resolverUrlImagen(rawPathOrUrl, hashLargo) {
 
 // 1. ENDPOINTS API
 
-// Obtener la lista de todas las instancias activas
 app.get('/api/instancias', async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -61,15 +54,37 @@ app.get('/api/instancias', async (req, res) => {
   }
 });
 
-// Obtener comprobantes procesando dinámicamente las URLs de R2
+// Consulta consolidada agrupando por hash_largo
 app.get('/api/comprobantes', async (req, res) => {
   try {
     const instanciaTarget = req.query.instancia || 'JAIRO';
+    const soloBinomios = req.query.solo_binomios === 'true';
+
+    let filtroConteo = '';
+    if (soloBinomios) {
+      filtroConteo = 'WHERE r.conteo > 1';
+    }
 
     const query = `
+      WITH raw_consolidado AS (
+        SELECT 
+          hash_largo,
+          MAX(instancia) as instancia,
+          MAX(conteo) as conteo,
+          MAX(timestamp_msg) as timestamp_msg,
+          MAX(NULLIF(nombre_push, '')) as nombre_push,
+          MAX(NULLIF(usuario_raw, '')) as usuario_raw,
+          MAX(NULLIF(grupo_raw, '')) as grupo_raw,
+          MAX(NULLIF(caption, '')) as caption,
+          MAX(NULLIF(url_imagen, '')) as url_imagen,
+          MAX(estado) as estado_raw
+        FROM registros_raw
+        WHERE LOWER(instancia) = LOWER($1)
+        GROUP BY hash_largo
+      )
       SELECT 
         r.hash_largo,
-        r.estado,
+        COALESCE(c.estado_ia, CASE WHEN r.conteo >= 2 THEN 'PROCESADO' ELSE r.estado_raw END) as estado,
         COALESCE(c.url_r2, r.url_imagen) as url_raw_db,
         r.timestamp_msg,
         r.nombre_push,
@@ -83,15 +98,14 @@ app.get('/api/comprobantes', async (req, res) => {
         c.banco,
         c.referencia,
         c.estado_ia
-      FROM registros_raw r
+      FROM raw_consolidado r
       LEFT JOIN comprobantes_raw c ON r.hash_largo = c.hash_largo
-      WHERE LOWER(r.instancia) = LOWER($1)
+      ${filtroConteo}
       ORDER BY r.timestamp_msg DESC
       LIMIT 60
     `;
     const { rows } = await pool.query(query, [instanciaTarget]);
 
-    // Sanitizar y reparar cada URL antes de enviarla al frontend
     const itemsFormateados = rows.map(row => ({
       ...row,
       url_imagen: resolverUrlImagen(row.url_raw_db, row.hash_largo)
@@ -103,7 +117,6 @@ app.get('/api/comprobantes', async (req, res) => {
   }
 });
 
-// Descarte lógico (Soft-Delete)
 app.delete('/api/comprobantes/:hash', async (req, res) => {
   const { hash } = req.params;
   try {
@@ -114,7 +127,7 @@ app.delete('/api/comprobantes/:hash', async (req, res) => {
   }
 });
 
-// 2. DASHBOARD WEB CON SELECTOR DE INSTANCIAS
+// 2. DASHBOARD WEB
 app.get('/', (req, res) => {
   res.send(`
 <!DOCTYPE html>
@@ -139,6 +152,15 @@ app.get('/', (req, res) => {
       </div>
 
       <div class="flex flex-wrap items-center gap-3">
+        <!-- Selector de Filtro Conteo -->
+        <div class="flex items-center gap-2 bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5">
+          <label for="select-filtro" class="text-xs font-semibold text-slate-400">Mostrar:</label>
+          <select id="select-filtro" onchange="cambiarFiltro(this.value)" class="bg-transparent text-emerald-400 font-bold text-xs focus:outline-none cursor-pointer">
+            <option value="todos" class="bg-slate-900 text-white">Todos los Eventos</option>
+            <option value="binomios" class="bg-slate-900 text-white">Solo Comprobantes (>1x)</option>
+          </select>
+        </div>
+
         <div class="flex items-center gap-2 bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5">
           <label for="select-instancia" class="text-xs font-semibold text-slate-400">Instancia:</label>
           <select id="select-instancia" onchange="cambiarInstancia(this.value)" class="bg-transparent text-sky-400 font-bold text-sm focus:outline-none cursor-pointer">
@@ -160,6 +182,9 @@ app.get('/', (req, res) => {
   <script>
     const urlParams = new URLSearchParams(window.location.search);
     let INSTANCIA_ACTUAL = urlParams.get('instancia') || 'JAIRO';
+    let SOLO_BINOMIOS = urlParams.get('filtro') === 'binomios';
+
+    document.getElementById('select-filtro').value = SOLO_BINOMIOS ? 'binomios' : 'todos';
 
     async function cargarInstancias() {
       try {
@@ -181,8 +206,21 @@ app.get('/', (req, res) => {
 
     function cambiarInstancia(nuevaInstancia) {
       INSTANCIA_ACTUAL = nuevaInstancia;
-      window.history.pushState({}, '', '?instancia=' + encodeURIComponent(nuevaInstancia));
+      actualizarURL();
       cargar();
+    }
+
+    function cambiarFiltro(val) {
+      SOLO_BINOMIOS = (val === 'binomios');
+      actualizarURL();
+      cargar();
+    }
+
+    function actualizarURL() {
+      const p = new URLSearchParams();
+      p.set('instancia', INSTANCIA_ACTUAL);
+      if (SOLO_BINOMIOS) p.set('filtro', 'binomios');
+      window.history.pushState({}, '', '?' + p.toString());
     }
 
     async function borrarRegistro(hash) {
@@ -195,7 +233,8 @@ app.get('/', (req, res) => {
 
     async function cargar() {
       try {
-        const res = await fetch('/api/comprobantes?instancia=' + encodeURIComponent(INSTANCIA_ACTUAL));
+        const url = \`/api/comprobantes?instancia=\${encodeURIComponent(INSTANCIA_ACTUAL)}&solo_binomios=\${SOLO_BINOMIOS}\`;
+        const res = await fetch(url);
         const items = await res.json();
 
         if (!Array.isArray(items)) {
@@ -206,7 +245,7 @@ app.get('/', (req, res) => {
         document.getElementById('c-total').innerText = items.length;
 
         if (items.length === 0) {
-          document.getElementById('grid-container').innerHTML = \`<div class="col-span-full text-center py-12 text-slate-500">No hay registros recientes para \${INSTANCIA_ACTUAL.toUpperCase()}.</div>\`;
+          document.getElementById('grid-container').innerHTML = \`<div class="col-span-full text-center py-12 text-slate-500">No hay registros para \${INSTANCIA_ACTUAL.toUpperCase()}.</div>\`;
           return;
         }
 
@@ -230,19 +269,23 @@ app.get('/', (req, res) => {
 
           let imgHTML = '<div class="w-full h-full flex items-center justify-center text-[10px] text-slate-600 font-mono text-center px-2">Sin Imagen<br>(Esperando 2x)</div>';
           if (item.url_imagen) {
-            imgHTML = \`<img src="\${item.url_imagen}" class="w-full h-full object-cover cursor-pointer hover:scale-105 transition" onclick="window.open(this.src)" title="Click para expandir" onerror="this.onerror=null; this.parentElement.innerHTML='<div class=\\'w-full h-full flex items-center justify-center text-[9px] text-rose-400 font-mono text-center px-1\\'>Error de Carga R2</div>';"/>\`;
+            imgHTML = \`<img src="\${item.url_imagen}" class="w-full h-full object-cover cursor-pointer hover:scale-105 transition" onclick="window.open(this.src)" title="Click para expandir" onerror="this.onerror=null; this.parentElement.innerHTML='<div class=\\'w-full h-full flex items-center justify-center text-[9px] text-rose-400 font-mono text-center px-1\\'>Error Carga R2</div>';"/>\`;
           }
 
           let extraccionIA = '';
-          if (item.monto || item.banco) {
+          if (item.monto || item.banco || item.referencia) {
             extraccionIA = \`
               <div class="mt-2 p-1.5 bg-emerald-900/20 border border-emerald-800/40 rounded flex flex-col gap-0.5">
-                <span class="text-[9px] text-emerald-500 font-bold uppercase tracking-wider">Lectura IA</span>
-                <span class="text-[11px] text-emerald-300"><strong>\${item.monto || '0'} \${item.moneda || ''}</strong> - \${item.banco || 'N/A'}</span>
+                <span class="text-[9px] text-emerald-500 font-bold uppercase tracking-wider">LECTURA IA</span>
+                <span class="text-[11px] text-emerald-300 font-bold">\${item.monto || '0'} \${item.moneda || ''} - \${item.banco || 'N/A'}</span>
                 <span class="text-[10px] text-emerald-400/70 font-mono">Ref: \${item.referencia || 'N/A'}</span>
               </div>
             \`;
           }
+
+          const remitenteNombre = item.nombre_push || 'Desconocido';
+          const jidUsuario = item.usuario_raw ? \`<span class="text-[9px] text-slate-500 font-mono block">JID: \${item.usuario_raw}</span>\` : '';
+          const jidGrupo = item.grupo_raw ? \`<span class="text-[9px] text-indigo-400/70 font-mono block">Grupo: \${item.grupo_raw}</span>\` : '';
 
           return \`
             <div class="card-bg border border-slate-800 rounded-xl p-4 shadow-lg flex flex-col justify-between space-y-3 hover:border-slate-700 transition">
@@ -263,9 +306,11 @@ app.get('/', (req, res) => {
                 <div class="flex-1 space-y-2 text-xs overflow-hidden">
                   <div class="border-b border-slate-800/50 pb-1.5">
                     <span class="text-slate-400 text-[10px] block font-semibold mb-0.5">Remitente:</span>
-                    <div class="font-bold text-sky-400 truncate text-[11px]" title="\${item.nombre_push || item.usuario_raw}">
-                      \${item.nombre_push || item.usuario_raw || 'Desconocido'}
+                    <div class="font-bold text-sky-400 truncate text-[11px]" title="\${remitenteNombre}">
+                      \${remitenteNombre}
                     </div>
+                    \${jidUsuario}
+                    \${jidGrupo}
                   </div>
                   
                   <div>
