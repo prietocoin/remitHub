@@ -22,56 +22,62 @@ async function getComprobantes(req, res) {
 
     let filtroConteo = '';
     if (soloBinomios) {
-      filtroConteo = 'WHERE GREATEST(r.total_impactos, r.conteo_max) > 1';
+      filtroConteo = 'WHERE GREATEST(i.total_impactos, COALESCE(r.conteo, 1)) > 1';
     }
 
     const query = `
-      WITH ranked_raw AS (
+      WITH ranked_impactos AS (
         SELECT 
-          *,
-          ROW_NUMBER() OVER (PARTITION BY hash_largo ORDER BY timestamp_msg ASC, ctid ASC) as num_impacto
-        FROM registros_raw
+          id,
+          hash_largo,
+          instancia,
+          usuario_raw,
+          grupo_raw,
+          nombre_push,
+          caption,
+          url_imagen,
+          timestamp_msg,
+          ROW_NUMBER() OVER (PARTITION BY hash_largo ORDER BY id ASC) as num_impacto
+        FROM impactos_raw
         WHERE LOWER(instancia) = LOWER($1)
       ),
-      raw_consolidado AS (
+      impactos_consolidados AS (
         SELECT 
           hash_largo,
           MAX(instancia) as instancia,
           COUNT(*) as total_impactos,
-          MAX(conteo) as conteo_max,
           MAX(timestamp_msg) as timestamp_msg,
-          -- Impacto 1 (Primer mensaje recibido)
+          -- Impacto 1 (Primer mensaje real en impactos_raw)
           MAX(NULLIF(nombre_push, '')) FILTER (WHERE num_impacto = 1) as nombre_push_1,
           MAX(NULLIF(usuario_raw, '')) FILTER (WHERE num_impacto = 1) as usuario_raw_1,
           MAX(NULLIF(grupo_raw, '')) FILTER (WHERE num_impacto = 1) as grupo_raw_1,
           MAX(NULLIF(caption, '')) FILTER (WHERE num_impacto = 1) as caption_1,
           MAX(NULLIF(url_imagen, '')) FILTER (WHERE num_impacto = 1) as url_imagen_1,
-          -- Impacto 2 (Segundo mensaje recibido)
+          -- Impacto 2 (Segundo mensaje real en impactos_raw)
           MAX(NULLIF(nombre_push, '')) FILTER (WHERE num_impacto = 2) as nombre_push_2,
           MAX(NULLIF(usuario_raw, '')) FILTER (WHERE num_impacto = 2) as usuario_raw_2,
           MAX(NULLIF(grupo_raw, '')) FILTER (WHERE num_impacto = 2) as grupo_raw_2,
           MAX(NULLIF(caption, '')) FILTER (WHERE num_impacto = 2) as caption_2,
-          MAX(NULLIF(url_imagen, '')) FILTER (WHERE num_impacto = 2) as url_imagen_2,
-          MAX(estado) as estado_raw
-        FROM ranked_raw
+          MAX(NULLIF(url_imagen, '')) FILTER (WHERE num_impacto = 2) as url_imagen_2
+        FROM ranked_impactos
         GROUP BY hash_largo
       )
       SELECT 
-        r.hash_largo,
-        COALESCE(c.estado_ia, CASE WHEN GREATEST(r.total_impactos, r.conteo_max) >= 2 THEN 'PROCESADO' ELSE r.estado_raw END) as estado,
-        r.timestamp_msg,
-        r.instancia,
-        GREATEST(r.total_impactos, r.conteo_max) as conteo,
-        r.nombre_push_1,
-        r.usuario_raw_1,
-        r.grupo_raw_1,
-        r.caption_1,
-        r.url_imagen_1,
-        r.nombre_push_2,
-        r.usuario_raw_2,
-        r.grupo_raw_2,
-        r.caption_2,
-        r.url_imagen_2,
+        i.hash_largo,
+        COALESCE(c.estado_ia, r.estado, 'RECIBIDO') as estado,
+        i.timestamp_msg,
+        i.instancia,
+        GREATEST(i.total_impactos, COALESCE(r.conteo, 1)) as conteo,
+        i.nombre_push_1,
+        i.usuario_raw_1,
+        i.grupo_raw_1,
+        i.caption_1,
+        i.url_imagen_1,
+        i.nombre_push_2,
+        i.usuario_raw_2,
+        i.grupo_raw_2,
+        i.caption_2,
+        i.url_imagen_2,
         c.url_r2 as url_r2_comprobante,
         c.monto,
         c.moneda,
@@ -79,12 +85,14 @@ async function getComprobantes(req, res) {
         c.referencia,
         c.titular,
         c.estado_ia
-      FROM raw_consolidado r
-      LEFT JOIN comprobantes_raw c ON r.hash_largo = c.hash_largo
+      FROM impactos_consolidados i
+      LEFT JOIN registros_raw r ON i.hash_largo = r.hash_largo
+      LEFT JOIN comprobantes_raw c ON i.hash_largo = c.hash_largo
       ${filtroConteo}
-      ORDER BY r.timestamp_msg DESC
+      ORDER BY i.timestamp_msg DESC
       LIMIT 60
     `;
+
     const { rows } = await pool.query(query, [instanciaTarget]);
 
     const itemsFormateados = rows.map(row => ({
