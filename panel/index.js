@@ -13,8 +13,8 @@ const app = express();
 app.use(express.json());
 const PORT = process.env.PORT || 3000;
 
-// Resolver y sanitizar URLs de R2
-function resolverUrlImagen(rawPathOrUrl, hashLargo) {
+// Función para resolver URLs públicas de Cloudflare R2
+function resolverUrlImagen(rawPathOrUrl, fallbackHashKey) {
   const r2Domain = (process.env.R2_PUBLIC_DOMAIN || '').replace(/\/$/, '');
 
   if (rawPathOrUrl) {
@@ -31,8 +31,8 @@ function resolverUrlImagen(rawPathOrUrl, hashLargo) {
     }
   }
 
-  if (r2Domain && hashLargo) {
-    return `${r2Domain}/comprobantes/${hashLargo}.jpg`;
+  if (r2Domain && fallbackHashKey) {
+    return `${r2Domain}/comprobantes/${fallbackHashKey}.jpg`;
   }
 
   return rawPathOrUrl || null;
@@ -54,7 +54,7 @@ app.get('/api/instancias', async (req, res) => {
   }
 });
 
-// Consulta consolidada agrupando por hash_largo
+// Consulta avanzada agrupando Impacto 1 e Impacto 2 por hash_largo
 app.get('/api/comprobantes', async (req, res) => {
   try {
     const instanciaTarget = req.query.instancia || 'JAIRO';
@@ -62,41 +62,62 @@ app.get('/api/comprobantes', async (req, res) => {
 
     let filtroConteo = '';
     if (soloBinomios) {
-      filtroConteo = 'WHERE r.conteo > 1';
+      filtroConteo = 'WHERE GREATEST(r.total_impactos, r.conteo_max) > 1';
     }
 
     const query = `
-      WITH raw_consolidado AS (
+      WITH ranked_raw AS (
+        SELECT 
+          *,
+          ROW_NUMBER() OVER (PARTITION BY hash_largo ORDER BY id ASC) as num_impacto
+        FROM registros_raw
+        WHERE LOWER(instancia) = LOWER($1)
+      ),
+      raw_consolidado AS (
         SELECT 
           hash_largo,
           MAX(instancia) as instancia,
-          MAX(conteo) as conteo,
+          COUNT(*) as total_impactos,
+          MAX(conteo) as conteo_max,
           MAX(timestamp_msg) as timestamp_msg,
-          MAX(NULLIF(nombre_push, '')) as nombre_push,
-          MAX(NULLIF(usuario_raw, '')) as usuario_raw,
-          MAX(NULLIF(grupo_raw, '')) as grupo_raw,
-          MAX(NULLIF(caption, '')) as caption,
-          MAX(NULLIF(url_imagen, '')) as url_imagen,
+          -- Impacto 1 (Primer mensaje recibido)
+          MAX(NULLIF(nombre_push, '')) FILTER (WHERE num_impacto = 1) as nombre_push_1,
+          MAX(NULLIF(usuario_raw, '')) FILTER (WHERE num_impacto = 1) as usuario_raw_1,
+          MAX(NULLIF(grupo_raw, '')) FILTER (WHERE num_impacto = 1) as grupo_raw_1,
+          MAX(NULLIF(caption, '')) FILTER (WHERE num_impacto = 1) as caption_1,
+          MAX(NULLIF(url_imagen, '')) FILTER (WHERE num_impacto = 1) as url_imagen_1,
+          -- Impacto 2 (Segundo mensaje / Binomio)
+          MAX(NULLIF(nombre_push, '')) FILTER (WHERE num_impacto = 2) as nombre_push_2,
+          MAX(NULLIF(usuario_raw, '')) FILTER (WHERE num_impacto = 2) as usuario_raw_2,
+          MAX(NULLIF(grupo_raw, '')) FILTER (WHERE num_impacto = 2) as grupo_raw_2,
+          MAX(NULLIF(caption, '')) FILTER (WHERE num_impacto = 2) as caption_2,
+          MAX(NULLIF(url_imagen, '')) FILTER (WHERE num_impacto = 2) as url_imagen_2,
           MAX(estado) as estado_raw
-        FROM registros_raw
-        WHERE LOWER(instancia) = LOWER($1)
+        FROM ranked_raw
         GROUP BY hash_largo
       )
       SELECT 
         r.hash_largo,
-        COALESCE(c.estado_ia, CASE WHEN r.conteo >= 2 THEN 'PROCESADO' ELSE r.estado_raw END) as estado,
-        COALESCE(c.url_r2, r.url_imagen) as url_raw_db,
+        COALESCE(c.estado_ia, CASE WHEN GREATEST(r.total_impactos, r.conteo_max) >= 2 THEN 'PROCESADO' ELSE r.estado_raw END) as estado,
         r.timestamp_msg,
-        r.nombre_push,
-        r.usuario_raw,
-        r.grupo_raw,
-        r.caption,
         r.instancia,
-        r.conteo,
+        GREATEST(r.total_impactos, r.conteo_max) as conteo,
+        r.nombre_push_1,
+        r.usuario_raw_1,
+        r.grupo_raw_1,
+        r.caption_1,
+        r.url_imagen_1,
+        r.nombre_push_2,
+        r.usuario_raw_2,
+        r.grupo_raw_2,
+        r.caption_2,
+        r.url_imagen_2,
+        c.url_r2 as url_r2_comprobante,
         c.monto,
         c.moneda,
         c.banco,
         c.referencia,
+        c.titular,
         c.estado_ia
       FROM raw_consolidado r
       LEFT JOIN comprobantes_raw c ON r.hash_largo = c.hash_largo
@@ -108,7 +129,8 @@ app.get('/api/comprobantes', async (req, res) => {
 
     const itemsFormateados = rows.map(row => ({
       ...row,
-      url_imagen: resolverUrlImagen(row.url_raw_db, row.hash_largo)
+      url_imagen_1: resolverUrlImagen(row.url_imagen_1 || row.url_r2_comprobante, row.hash_largo),
+      url_imagen_2: row.url_imagen_2 ? resolverUrlImagen(row.url_imagen_2, row.hash_largo + '_2') : null
     }));
 
     res.json(itemsFormateados);
@@ -152,7 +174,6 @@ app.get('/', (req, res) => {
       </div>
 
       <div class="flex flex-wrap items-center gap-3">
-        <!-- Selector de Filtro Conteo -->
         <div class="flex items-center gap-2 bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5">
           <label for="select-filtro" class="text-xs font-semibold text-slate-400">Mostrar:</label>
           <select id="select-filtro" onchange="cambiarFiltro(this.value)" class="bg-transparent text-emerald-400 font-bold text-xs focus:outline-none cursor-pointer">
@@ -267,25 +288,76 @@ app.get('/', (req, res) => {
             fechaTexto = new Date(ts > 9999999999 ? ts : ts * 1000).toLocaleString('es-ES');
           }
 
-          let imgHTML = '<div class="w-full h-full flex items-center justify-center text-[10px] text-slate-600 font-mono text-center px-2">Sin Imagen<br>(Esperando 2x)</div>';
-          if (item.url_imagen) {
-            imgHTML = \`<img src="\${item.url_imagen}" class="w-full h-full object-cover cursor-pointer hover:scale-105 transition" onclick="window.open(this.src)" title="Click para expandir" onerror="this.onerror=null; this.parentElement.innerHTML='<div class=\\'w-full h-full flex items-center justify-center text-[9px] text-rose-400 font-mono text-center px-1\\'>Error Carga R2</div>';"/>\`;
-          }
-
+          // Bloque Lectura IA incluyendo Titular
           let extraccionIA = '';
-          if (item.monto || item.banco || item.referencia) {
+          if (item.monto || item.banco || item.referencia || item.titular) {
             extraccionIA = \`
-              <div class="mt-2 p-1.5 bg-emerald-900/20 border border-emerald-800/40 rounded flex flex-col gap-0.5">
-                <span class="text-[9px] text-emerald-500 font-bold uppercase tracking-wider">LECTURA IA</span>
+              <div class="mt-2 p-2 bg-emerald-950/40 border border-emerald-700/50 rounded-lg flex flex-col gap-1">
+                <span class="text-[9px] text-emerald-400 font-extrabold uppercase tracking-wider">LECTURA IA</span>
                 <span class="text-[11px] text-emerald-300 font-bold">\${item.monto || '0'} \${item.moneda || ''} - \${item.banco || 'N/A'}</span>
-                <span class="text-[10px] text-emerald-400/70 font-mono">Ref: \${item.referencia || 'N/A'}</span>
+                <div class="text-[10px] text-emerald-200/90 font-medium truncate" title="\${item.titular || 'N/A'}">
+                  👤 Titular: <strong>\${item.titular || 'N/A'}</strong>
+                </div>
+                <span class="text-[10px] text-emerald-400/80 font-mono">Ref: \${item.referencia || 'N/A'}</span>
               </div>
             \`;
           }
 
-          const remitenteNombre = item.nombre_push || 'Desconocido';
-          const jidUsuario = item.usuario_raw ? \`<span class="text-[9px] text-slate-500 font-mono block">JID: \${item.usuario_raw}</span>\` : '';
-          const jidGrupo = item.grupo_raw ? \`<span class="text-[9px] text-indigo-400/70 font-mono block">Grupo: \${item.grupo_raw}</span>\` : '';
+          // Renderizado de Imágenes Duales (Img 1 e Img 2)
+          let img1HTML = item.url_imagen_1 
+            ? \`<img src="\${item.url_imagen_1}" class="w-full h-full object-cover cursor-pointer hover:scale-105 transition" onclick="window.open(this.src)" title="Imagen 1 - Click para expandir" onerror="this.onerror=null; this.parentElement.innerHTML='<div class=\\'w-full h-full flex items-center justify-center text-[9px] text-amber-400 font-mono text-center px-1\\'>Img 1 R2</div>';"/>\`
+            : '<div class="w-full h-full flex items-center justify-center text-[9px] text-slate-600 font-mono text-center">Sin Img 1</div>';
+
+          let img2HTML = item.url_imagen_2 
+            ? \`<img src="\${item.url_imagen_2}" class="w-full h-full object-cover cursor-pointer hover:scale-105 transition" onclick="window.open(this.src)" title="Imagen 2 - Click para expandir" onerror="this.onerror=null; this.parentElement.innerHTML='<div class=\\'w-full h-full flex items-center justify-center text-[9px] text-amber-400 font-mono text-center px-1\\'>Img 2 R2</div>';"/>\`
+            : null;
+
+          let containerImagenes = '';
+          if (img2HTML) {
+            containerImagenes = \`
+              <div class="flex flex-col gap-1.5 w-28 flex-shrink-0">
+                <div class="h-24 bg-slate-900 rounded-lg overflow-hidden border border-slate-800 relative">
+                  <span class="absolute top-0.5 left-0.5 bg-slate-950/80 text-[8px] text-slate-300 px-1 rounded z-10">Img 1</span>
+                  \${img1HTML}
+                </div>
+                <div class="h-24 bg-slate-900 rounded-lg overflow-hidden border border-slate-800 relative">
+                  <span class="absolute top-0.5 left-0.5 bg-indigo-950/80 text-[8px] text-indigo-300 px-1 rounded z-10">Img 2</span>
+                  \${img2HTML}
+                </div>
+              </div>
+            \`;
+          } else {
+            containerImagenes = \`
+              <div class="w-28 h-48 bg-slate-900 rounded-lg overflow-hidden border border-slate-800 flex-shrink-0">
+                \${img1HTML}
+              </div>
+            \`;
+          }
+
+          // Formateo Metadatos Impacto 1
+          const p1 = item.nombre_push_1 || 'Desconocido';
+          const u1 = item.usuario_raw_1 ? \`<span class="text-[9px] text-slate-400 font-mono block truncate" title="\${item.usuario_raw_1}">JID 1: \${item.usuario_raw_1}</span>\` : '';
+          const g1 = item.grupo_raw_1 ? \`<span class="text-[9px] text-indigo-400/80 font-mono block truncate" title="\${item.grupo_raw_1}">Grupo 1: \${item.grupo_raw_1}</span>\` : '';
+          const c1 = item.caption_1;
+
+          // Formateo Metadatos Impacto 2 (Si existe 2x)
+          let impacto2HTML = '';
+          if (totalConteo >= 2 || item.usuario_raw_2 || item.grupo_raw_2 || item.caption_2) {
+            const p2 = item.nombre_push_2 || p1;
+            const u2 = item.usuario_raw_2 ? \`<span class="text-[9px] text-slate-400 font-mono block truncate" title="\${item.usuario_raw_2}">JID 2: \${item.usuario_raw_2}</span>\` : u1;
+            const g2 = item.grupo_raw_2 ? \`<span class="text-[9px] text-indigo-400/80 font-mono block truncate" title="\${item.grupo_raw_2}">Grupo 2: \${item.grupo_raw_2}</span>\` : g1;
+            const c2 = item.caption_2;
+
+            impacto2HTML = \`
+              <div class="mt-2 pt-2 border-t border-slate-800/80 space-y-1">
+                <span class="text-[9px] text-indigo-400 font-extrabold uppercase tracking-wider block">IMPACTO 2x</span>
+                <div class="font-bold text-sky-400 truncate text-[10px]" title="\${p2}">\${p2}</div>
+                \${u2}
+                \${g2}
+                \${c2 ? \`<div class="bg-slate-900/80 p-1.5 rounded text-slate-300 text-[10px] italic border border-slate-800 max-h-10 overflow-y-auto">\${c2}</div>\` : ''}
+              </div>
+            \`;
+          }
 
           return \`
             <div class="card-bg border border-slate-800 rounded-xl p-4 shadow-lg flex flex-col justify-between space-y-3 hover:border-slate-700 transition">
@@ -299,27 +371,24 @@ app.get('/', (req, res) => {
               </div>
 
               <div class="flex gap-3 items-start">
-                <div class="w-28 h-44 bg-slate-900 rounded-lg overflow-hidden border border-slate-800 flex-shrink-0">
-                  \${imgHTML}
-                </div>
+                \${containerImagenes}
                 
                 <div class="flex-1 space-y-2 text-xs overflow-hidden">
-                  <div class="border-b border-slate-800/50 pb-1.5">
-                    <span class="text-slate-400 text-[10px] block font-semibold mb-0.5">Remitente:</span>
-                    <div class="font-bold text-sky-400 truncate text-[11px]" title="\${remitenteNombre}">
-                      \${remitenteNombre}
-                    </div>
-                    \${jidUsuario}
-                    \${jidGrupo}
-                  </div>
-                  
-                  <div>
-                    <span class="text-slate-500 text-[10px] block mb-0.5 font-semibold">Texto (Caption):</span>
-                    <div class="bg-slate-900 p-2 rounded text-slate-300 text-[11px] max-h-12 overflow-y-auto italic border border-slate-800">
-                      \${item.caption ? item.caption : '<span class="text-slate-600">Sin texto...</span>'}
+                  <!-- Impacto 1 -->
+                  <div class="space-y-1">
+                    <span class="text-slate-400 text-[9px] font-bold block uppercase tracking-wider">IMPACTO 1x</span>
+                    <div class="font-bold text-sky-400 truncate text-[11px]" title="\${p1}">\${p1}</div>
+                    \${u1}
+                    \${g1}
+                    <div class="bg-slate-900 p-1.5 rounded text-slate-300 text-[10px] max-h-10 overflow-y-auto italic border border-slate-800">
+                      \${c1 ? c1 : '<span class="text-slate-600">Sin texto...</span>'}
                     </div>
                   </div>
-                  
+
+                  <!-- Impacto 2 -->
+                  \${impacto2HTML}
+
+                  <!-- Lectura IA -->
                   \${extraccionIA}
 
                 </div>
