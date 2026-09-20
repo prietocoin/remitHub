@@ -1,6 +1,11 @@
 const { Worker, Queue } = require('bullmq');
 const Redis = require('ioredis');
 const { Pool } = require('pg');
+const { PutObjectCommand } = require('@aws-sdk/client-s3');
+
+// Importar servicios y configuraciones transferidas desde Ingesta
+const s3Client = require('./src/config/r2');
+const { obtenerBufferImagen } = require('./src/services/evolution');
 
 // 1. Conexiones
 const pool = new Pool({
@@ -21,50 +26,104 @@ const redisConnection = new Redis({
 // 2. Cola de destino hacia el Extractor
 const colaExtractor = new Queue('cola-extractor', { connection: redisConnection });
 
+// Helper: Descarga desde Evolution API y sube a Cloudflare R2 solo una vez por Hash
+async function asegurarImagenEnR2(hashLargo, rawPayload, instancia) {
+  // Verificar si ya existe una URL de R2 para este hash en DB
+  const checkDb = await pool.query(
+    `SELECT url_imagen FROM impactos_raw WHERE hash_largo = $1 AND url_imagen IS NOT NULL LIMIT 1`,
+    [hashLargo]
+  );
+
+  if (checkDb.rows.length > 0 && checkDb.rows[0].url_imagen) {
+    return checkDb.rows[0].url_imagen;
+  }
+
+  // Extraer objeto de mensaje del payload de WhatsApp
+  const item = Array.isArray(rawPayload) ? rawPayload[0] : rawPayload;
+  const body = item?.body || item || {};
+  const data = body?.data || {};
+  const key = data?.key || {};
+  const message = data?.message || {};
+
+  console.log(`[Validador] ☁️ Descargando imagen desde Evolution API para Hash: ${hashLargo.slice(-8)}...`);
+  const imageBuffer = await obtenerBufferImagen(instancia, data?.instanceId, key, message);
+
+  if (!imageBuffer) {
+    console.error(`[Validador ⚠️] No se pudo obtener el buffer de la imagen para Hash: ${hashLargo}`);
+    return null;
+  }
+
+  // Subir a R2
+  const keyR2 = `comprobantes/${hashLargo}.jpg`;
+  const bucketName = process.env.R2_BUCKET_NAME || 'remesas-img';
+
+  await s3Client.send(new PutObjectCommand({
+    Bucket: bucketName,
+    Key: keyR2,
+    Body: imageBuffer,
+    ContentType: 'image/jpeg',
+  }));
+
+  const publicDomain = process.env.R2_PUBLIC_DOMAIN || '';
+  const urlR2 = publicDomain ? `${publicDomain}/${keyR2}` : keyR2;
+
+  console.log(`[Validador] ✅ Imagen guardada en R2: ${urlR2}`);
+  return urlR2;
+}
+
 // 3. Worker: Escucha la cola-validador
 const worker = new Worker('cola-validador', async (job) => {
   const payload = job.data;
-  console.log(`[Validador] ⚙️ Trabajo recibido de Redis. Hash: ${payload?.hash_largo || 'DESCONOCIDO'}`);
+  const { 
+    impactoId, hashLargo, hashCorto, instancia, 
+    usuarioRaw, grupoRaw, nombrePush, caption, timestampMsg, rawPayload 
+  } = payload;
+
+  console.log(`[Validador] ⚙️ Procesando Impacto #${impactoId} | Hash: ${hashCorto || hashLargo?.slice(-8)}`);
 
   try {
-    // A. Guardar o incrementar conteo en registros_raw
+    // A. Garantizar la presencia de la imagen en R2
+    const urlR2 = await asegurarImagenEnR2(hashLargo, rawPayload, instancia);
+
+    if (urlR2 && impactoId) {
+      // Registrar la URL en el impacto_raw correspondiente
+      await pool.query(`UPDATE impactos_raw SET url_imagen = $1 WHERE id = $2`, [urlR2, impactoId]);
+    }
+
+    // B. Actualizar o Insertar en registros_raw (Conteo acumulativo)
     const { rows } = await pool.query(`
       INSERT INTO registros_raw (
         hash_largo, hash_corto, grupo_raw, usuario_raw, nombre_push, 
         caption, timestamp_msg, es_imagen, instancia, url_imagen, conteo, estado
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 1, 'RECIBIDO')
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8, $9, 1, 'RECIBIDO')
       ON CONFLICT (hash_largo) DO UPDATE SET 
         conteo = registros_raw.conteo + 1,
         caption = COALESCE(NULLIF(EXCLUDED.caption, ''), registros_raw.caption),
-        es_imagen = EXCLUDED.es_imagen OR registros_raw.es_imagen,
         url_imagen = COALESCE(EXCLUDED.url_imagen, registros_raw.url_imagen)
       RETURNING conteo, url_imagen, estado;
     `, [
-      payload.hash_largo,
-      payload.hash_corto || '',
-      payload.grupo_raw || '',
-      payload.usuario_raw || '',
-      payload.nombre_push || 'Desconocido',
-      payload.caption || '',
-      payload.timestamp_msg || Math.floor(Date.now() / 1000),
-      Boolean(payload.es_imagen),
-      payload.instancia || 'JAIRO',
-      payload.url_r2 || payload.url_imagen || null
+      hashLargo,
+      hashCorto || hashLargo.slice(-8),
+      grupoRaw || '',
+      usuarioRaw || '',
+      nombrePush || 'Desconocido',
+      caption || '',
+      timestampMsg || Math.floor(Date.now() / 1000),
+      instancia || 'JAIRO',
+      urlR2
     ]);
 
     const registro = rows[0];
     console.log(`[Validador] 📊 Estado en DB -> Conteo: ${registro.conteo}x | Estado: ${registro.estado}`);
 
-    // B. Regla de Negocio: Activar solo si alcanza el Binomio (>= 2x)
+    // C. Regla de Negocio: Activar solo al alcanzar el Binomio (>= 2x)
     if (registro.conteo >= 2 && registro.estado === 'RECIBIDO') {
-      console.log(`[Validador] 🚀 Binomio 2x alcanzado para: ${payload.hash_largo}`);
+      console.log(`[Validador] 🚀 Binomio 2x alcanzado para Hash: ${hashCorto}`);
 
-      // Transacción atómica en PostgreSQL
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
 
-        // Insertar/actualizar en la tabla operativa de comprobantes
         await client.query(`
           INSERT INTO comprobantes_raw (hash_largo, instancia, url_r2, estado_ia) 
           VALUES ($1, $2, $3, 'LISTO_PARA_IA')
@@ -72,15 +131,14 @@ const worker = new Worker('cola-validador', async (job) => {
             url_r2 = COALESCE(EXCLUDED.url_r2, comprobantes_raw.url_r2),
             estado_ia = 'LISTO_PARA_IA';
         `, [
-          payload.hash_largo, 
-          payload.instancia || 'JAIRO', 
-          payload.url_r2 || registro.url_imagen || null
+          hashLargo, 
+          instancia || 'JAIRO', 
+          urlR2 || registro.url_imagen || null
         ]);
 
-        // Cambiar estado en auditoría a EN_COLA para prevenir doble procesamiento
         await client.query(`
           UPDATE registros_raw SET estado = 'EN_COLA' WHERE hash_largo = $1;
-        `, [payload.hash_largo]);
+        `, [hashLargo]);
 
         await client.query('COMMIT');
       } catch (dbErr) {
@@ -90,21 +148,20 @@ const worker = new Worker('cola-validador', async (job) => {
         client.release();
       }
 
-      // C. Despachar a la cola del Extractor
+      // D. Despachar a la cola del Extractor
       await colaExtractor.add('extraer-datos', {
-        hash_largo: payload.hash_largo,
-        instancia: payload.instancia || 'JAIRO',
-        key_r2: payload.key_r2,
-        url_r2: payload.url_r2 || registro.url_imagen
+        hash_largo: hashLargo,
+        instancia: instancia || 'JAIRO',
+        url_r2: urlR2 || registro.url_imagen
       }, { removeOnComplete: true });
 
-      console.log(`[Validador] ✅ Evento derivado al Extractor: ${payload.hash_largo}`);
+      console.log(`[Validador] ✅ Evento derivado al Extractor: ${hashCorto}`);
     } else {
-      console.log(`[Validador] ⏳ 1x registrado. En espera del segundo impacto para el Hash: ${payload.hash_largo}`);
+      console.log(`[Validador] ⏳ ${registro.conteo}x registrado. En espera del binomio para Hash: ${hashCorto}`);
     }
 
   } catch (err) {
-    console.error(`[Validador ERROR] Falló el procesamiento del Hash ${payload?.hash_largo}:`, err.message);
+    console.error(`[Validador ERROR] Falló el procesamiento del Impacto #${impactoId}:`, err.message);
     throw err;
   }
 }, { 
