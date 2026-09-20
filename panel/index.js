@@ -13,7 +13,6 @@ const app = express();
 app.use(express.json());
 const PORT = process.env.PORT || 3000;
 
-// Función para resolver URLs públicas de Cloudflare R2
 function resolverUrlImagen(rawPathOrUrl, fallbackHashKey) {
   const r2Domain = (process.env.R2_PUBLIC_DOMAIN || '').replace(/\/$/, '');
 
@@ -54,7 +53,6 @@ app.get('/api/instancias', async (req, res) => {
   }
 });
 
-// Consulta avanzada agrupando Impacto 1 e Impacto 2 sin requerir columna 'id'
 app.get('/api/comprobantes', async (req, res) => {
   try {
     const instanciaTarget = req.query.instancia || 'JAIRO';
@@ -86,7 +84,7 @@ app.get('/api/comprobantes', async (req, res) => {
           MAX(NULLIF(grupo_raw, '')) FILTER (WHERE num_impacto = 1) as grupo_raw_1,
           MAX(NULLIF(caption, '')) FILTER (WHERE num_impacto = 1) as caption_1,
           MAX(NULLIF(url_imagen, '')) FILTER (WHERE num_impacto = 1) as url_imagen_1,
-          -- Impacto 2 (Segundo mensaje / Binomio)
+          -- Impacto 2 (Segundo mensaje recibido)
           MAX(NULLIF(nombre_push, '')) FILTER (WHERE num_impacto = 2) as nombre_push_2,
           MAX(NULLIF(usuario_raw, '')) FILTER (WHERE num_impacto = 2) as usuario_raw_2,
           MAX(NULLIF(grupo_raw, '')) FILTER (WHERE num_impacto = 2) as grupo_raw_2,
@@ -334,18 +332,18 @@ app.get('/', (req, res) => {
             \`;
           }
 
-          // Formateo Metadatos Impacto 1
+          // Datos Impacto 1
           const p1 = item.nombre_push_1 || 'Desconocido';
           const u1 = item.usuario_raw_1 ? \`<span class="text-[9px] text-slate-400 font-mono block truncate" title="\${item.usuario_raw_1}">JID 1: \${item.usuario_raw_1}</span>\` : '';
           const g1 = item.grupo_raw_1 ? \`<span class="text-[9px] text-indigo-400/80 font-mono block truncate" title="\${item.grupo_raw_1}">Grupo 1: \${item.grupo_raw_1}</span>\` : '';
           const c1 = item.caption_1;
 
-          // Formateo Metadatos Impacto 2 (Si existe 2x)
+          // Datos Impacto 2 (Estricto: No clona variables de Impacto 1)
           let impacto2HTML = '';
-          if (totalConteo >= 2 || item.usuario_raw_2 || item.grupo_raw_2 || item.caption_2) {
-            const p2 = item.nombre_push_2 || p1;
-            const u2 = item.usuario_raw_2 ? \`<span class="text-[9px] text-slate-400 font-mono block truncate" title="\${item.usuario_raw_2}">JID 2: \${item.usuario_raw_2}</span>\` : u1;
-            const g2 = item.grupo_raw_2 ? \`<span class="text-[9px] text-indigo-400/80 font-mono block truncate" title="\${item.grupo_raw_2}">Grupo 2: \${item.grupo_raw_2}</span>\` : g1;
+          if (totalConteo >= 2 || item.nombre_push_2 || item.usuario_raw_2 || item.grupo_raw_2 || item.caption_2) {
+            const p2 = item.nombre_push_2 || 'Desconocido (2x)';
+            const u2 = item.usuario_raw_2 ? \`<span class="text-[9px] text-slate-400 font-mono block truncate" title="\${item.usuario_raw_2}">JID 2: \${item.usuario_raw_2}</span>\` : '<span class="text-[9px] text-slate-600 font-mono block">JID 2: Sin registrar</span>';
+            const g2 = item.grupo_raw_2 ? \`<span class="text-[9px] text-indigo-400/80 font-mono block truncate" title="\${item.grupo_raw_2}">Grupo 2: \${item.grupo_raw_2}</span>\` : '<span class="text-[9px] text-slate-600 font-mono block">Grupo 2: Sin registrar</span>';
             const c2 = item.caption_2;
 
             impacto2HTML = \`
@@ -354,7 +352,9 @@ app.get('/', (req, res) => {
                 <div class="font-bold text-sky-400 truncate text-[10px]" title="\${p2}">\${p2}</div>
                 \${u2}
                 \${g2}
-                \${c2 ? \`<div class="bg-slate-900/80 p-1.5 rounded text-slate-300 text-[10px] italic border border-slate-800 max-h-10 overflow-y-auto">\${c2}</div>\` : ''}
+                <div class="bg-slate-900/80 p-1.5 rounded text-slate-300 text-[10px] italic border border-slate-800 max-h-10 overflow-y-auto">
+                  \${c2 ? c2 : '<span class="text-slate-600">Sin texto...</span>'}
+                </div>
               </div>
             \`;
           }
