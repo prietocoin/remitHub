@@ -1,15 +1,13 @@
 {
-  "name": "ensamblador",
+  "name": "ensamblador-service",
   "version": "1.0.0",
-  "description": "Módulo Capa 4: Guarda resultados de IA en BD e inicia el enrutamiento",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node --watch index.js"
+    "start": "node index.js"
   },
   "dependencies": {
-    "bullmq": "^5.7.0",
+    "bullmq": "^5.0.0",
     "ioredis": "^5.4.1",
-    "pg": "^8.11.5"
+    "pg": "^8.12.0"
   }
 }
