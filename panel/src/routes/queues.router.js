@@ -4,15 +4,16 @@ const { BullMQAdapter } = require('@bull-board/api/bullMQAdapter');
 const { ExpressAdapter } = require('@bull-board/express');
 const redisConfig = require('../config/redis');
 
-// Adaptador para Express
+// Configuración del adaptador
 const serverAdapter = new ExpressAdapter();
 serverAdapter.setBasePath('/admin/queues');
 
-// Conexión a las 3 colas activas
+// Instancia de las 3 colas
 const colaValidador = new Queue('cola-validador', { connection: redisConfig });
 const colaEnsamblador = new Queue('cola-ensamblador', { connection: redisConfig });
 const colaDistribuidor = new Queue('cola-distribuidor', { connection: redisConfig });
 
+// Creación del tablero
 createBullBoard({
   queues: [
     new BullMQAdapter(colaValidador),
@@ -22,7 +23,5 @@ createBullBoard({
   serverAdapter: serverAdapter,
 });
 
-module.exports = {
-  path: '/admin/queues',
-  router: serverAdapter.getRouter()
-};
+// Exportar directamente el router de Express
+module.exports = serverAdapter.getRouter();
