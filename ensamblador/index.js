@@ -16,24 +16,26 @@ const worker = new Worker('cola-ensamblador', async (job) => {
     await cliente.query('BEGIN');
 
     // A. Actualiza la tabla operativa con los datos extraídos por la IA
-    await cliente.query(`
-      UPDATE comprobantes_raw SET 
-        monto = $1, 
-        moneda = $2, 
-        banco = $3, 
-        referencia = $4, 
-        titular = $5, 
-        estado_ia = 'PROCESADO',
-        procesado_ia = true
-      WHERE hash_largo = $6
-    `, [
-      datos.monto !== undefined ? datos.monto : null,
-      datos.moneda || null,
-      datos.banco || null,
-      datos.referencia || null,
-      datos.titular || null,
-      hash_largo
-    ]);
+   await cliente.query(`
+  INSERT INTO comprobantes_raw (
+    hash_largo, monto, moneda, banco, referencia, titular, estado_ia, procesado_ia
+  ) VALUES ($1, $2, $3, $4, $5, $6, 'PROCESADO', true)
+  ON CONFLICT (hash_largo) DO UPDATE SET
+    monto = EXCLUDED.monto,
+    moneda = EXCLUDED.moneda,
+    banco = EXCLUDED.banco,
+    referencia = EXCLUDED.referencia,
+    titular = EXCLUDED.titular,
+    estado_ia = 'PROCESADO',
+    procesado_ia = true;
+`, [
+  hash_largo,
+  datos.monto !== undefined ? datos.monto : null,
+  datos.moneda || null,
+  datos.banco || null,
+  datos.referencia || null,
+  datos.titular || null
+]);
 
     // B. Cierra el ciclo en la tabla inmutable de auditoría
     await cliente.query(`
