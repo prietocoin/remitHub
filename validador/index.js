@@ -3,7 +3,6 @@ const Redis = require('ioredis');
 const { Pool } = require('pg');
 const { PutObjectCommand } = require('@aws-sdk/client-s3');
 
-// Importar servicios y configuraciones transferidas desde Ingesta
 const s3Client = require('./src/config/r2');
 const { obtenerBufferImagen } = require('./src/services/evolution');
 
@@ -26,9 +25,8 @@ const redisConnection = new Redis({
 // 2. Cola de destino hacia el Extractor
 const colaExtractor = new Queue('cola-extractor', { connection: redisConnection });
 
-// Helper: Descarga desde Evolution API y sube a Cloudflare R2 solo una vez por Hash
+// Helper: Descarga desde Evolution API y sube a Cloudflare R2
 async function asegurarImagenEnR2(hashLargo, rawPayload, instancia) {
-  // Verificar si ya existe una URL de R2 para este hash en DB
   const checkDb = await pool.query(
     `SELECT url_imagen FROM impactos_raw WHERE hash_largo = $1 AND url_imagen IS NOT NULL LIMIT 1`,
     [hashLargo]
@@ -38,7 +36,6 @@ async function asegurarImagenEnR2(hashLargo, rawPayload, instancia) {
     return checkDb.rows[0].url_imagen;
   }
 
-  // Extraer objeto de mensaje del payload de WhatsApp
   const item = Array.isArray(rawPayload) ? rawPayload[0] : rawPayload;
   const body = item?.body || item || {};
   const data = body?.data || {};
@@ -53,7 +50,6 @@ async function asegurarImagenEnR2(hashLargo, rawPayload, instancia) {
     return null;
   }
 
-  // Subir a R2
   const keyR2 = `comprobantes/${hashLargo}.jpg`;
   const bucketName = process.env.R2_BUCKET_NAME || 'remesas-img';
 
@@ -75,11 +71,10 @@ async function asegurarImagenEnR2(hashLargo, rawPayload, instancia) {
 const worker = new Worker('cola-validador', async (job) => {
   const payload = job.data;
 
-  // Normalización de Hash (soporta snake_case y camelCase)
+  // Normalización de Hash
   const hashLargo = payload.hash_largo || payload.hashLargo;
   const hashCorto = payload.hash_corto || payload.hashCorto || (hashLargo ? hashLargo.slice(-8) : null);
 
-  // Guardia de seguridad: Abortar si no hay Hash válido
   if (!hashLargo) {
     console.error(`[Validador ❌] Job ${job.id} rechazado: No se recibió hash_largo en el payload.`, payload);
     throw new Error('Payload inválido: falta hash_largo');
@@ -97,7 +92,6 @@ const worker = new Worker('cola-validador', async (job) => {
     const urlR2 = await asegurarImagenEnR2(hashLargo, rawPayload, instancia);
 
     if (urlR2 && impactoId) {
-      // Registrar la URL en el impacto_raw correspondiente
       await pool.query(`UPDATE impactos_raw SET url_imagen = $1 WHERE id = $2`, [urlR2, impactoId]);
     }
 
@@ -135,6 +129,7 @@ const worker = new Worker('cola-validador', async (job) => {
       try {
         await client.query('BEGIN');
 
+        // 1. Asentar registro base en comprobantes_raw
         await client.query(`
           INSERT INTO comprobantes_raw (hash_largo, instancia, url_r2, estado_ia) 
           VALUES ($1, $2, $3, 'LISTO_PARA_IA')
@@ -147,26 +142,27 @@ const worker = new Worker('cola-validador', async (job) => {
           urlR2 || registro.url_imagen || null
         ]);
 
+        // 2. Despachar a Redis ANTES de cerrar la transacción
+        await colaExtractor.add('extraer-datos', {
+          hash_largo: hashLargo,
+          instancia: instancia || 'JAIRO',
+          url_r2: urlR2 || registro.url_imagen
+        }, { removeOnComplete: true });
+
+        // 3. Actualizar estado en registros_raw
         await client.query(`
           UPDATE registros_raw SET estado = 'EN_COLA' WHERE hash_largo = $1;
         `, [hashLargo]);
 
         await client.query('COMMIT');
+        console.log(`[Validador] ✅ Evento derivado al Extractor: ${hashCorto}`);
+
       } catch (dbErr) {
         await client.query('ROLLBACK');
-        throw dbErr;
+        throw dbErr; // Forzar reintento en BullMQ si falla SQL o Redis
       } finally {
         client.release();
       }
-
-      // D. Despachar a la cola del Extractor
-      await colaExtractor.add('extraer-datos', {
-        hash_largo: hashLargo,
-        instancia: instancia || 'JAIRO',
-        url_r2: urlR2 || registro.url_imagen
-      }, { removeOnComplete: true });
-
-      console.log(`[Validador] ✅ Evento derivado al Extractor: ${hashCorto}`);
     } else {
       console.log(`[Validador] ⏳ ${registro.conteo}x registrado. En espera del binomio para Hash: ${hashCorto}`);
     }
@@ -201,7 +197,7 @@ setInterval(async () => {
       SET estado = 'CADUCADO' 
       WHERE conteo = 1 
       AND estado = 'RECIBIDO'
-      AND timestamp_msg::bigint < (EXTRACT(EPOCH FROM NOW()) - 172800)
+      AND NULLIF(timestamp_msg, '')::bigint < (EXTRACT(EPOCH FROM NOW()) - 172800)
     `);
     if (rowCount > 0) console.log(`[Validador Limpieza] ${rowCount} registros (1x) marcados como CADUCADO.`);
   } catch (error) {
