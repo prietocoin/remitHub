@@ -74,12 +74,23 @@ async function asegurarImagenEnR2(hashLargo, rawPayload, instancia) {
 // 3. Worker: Escucha la cola-validador
 const worker = new Worker('cola-validador', async (job) => {
   const payload = job.data;
+
+  // Normalización de Hash (soporta snake_case y camelCase)
+  const hashLargo = payload.hash_largo || payload.hashLargo;
+  const hashCorto = payload.hash_corto || payload.hashCorto || (hashLargo ? hashLargo.slice(-8) : null);
+
+  // Guardia de seguridad: Abortar si no hay Hash válido
+  if (!hashLargo) {
+    console.error(`[Validador ❌] Job ${job.id} rechazado: No se recibió hash_largo en el payload.`, payload);
+    throw new Error('Payload inválido: falta hash_largo');
+  }
+
   const { 
-    impactoId, hashLargo, hashCorto, instancia, 
-    usuarioRaw, grupoRaw, nombrePush, caption, timestampMsg, rawPayload 
+    impactoId, instancia, usuarioRaw, grupoRaw, 
+    nombrePush, caption, timestampMsg, rawPayload 
   } = payload;
 
-  console.log(`[Validador] ⚙️ Procesando Impacto #${impactoId} | Hash: ${hashCorto || hashLargo?.slice(-8)}`);
+  console.log(`[Validador] ⚙️ Procesando Impacto #${impactoId || 'N/A'} | Hash: ${hashCorto}`);
 
   try {
     // A. Garantizar la presencia de la imagen en R2
@@ -103,7 +114,7 @@ const worker = new Worker('cola-validador', async (job) => {
       RETURNING conteo, url_imagen, estado;
     `, [
       hashLargo,
-      hashCorto || hashLargo.slice(-8),
+      hashCorto,
       grupoRaw || '',
       usuarioRaw || '',
       nombrePush || 'Desconocido',
@@ -161,7 +172,7 @@ const worker = new Worker('cola-validador', async (job) => {
     }
 
   } catch (err) {
-    console.error(`[Validador ERROR] Falló el procesamiento del Impacto #${impactoId}:`, err.message);
+    console.error(`[Validador ERROR] Falló el procesamiento del Hash ${hashCorto}:`, err.message);
     throw err;
   }
 }, { 
