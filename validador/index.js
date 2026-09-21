@@ -27,23 +27,29 @@ const colaExtractor = new Queue('cola-extractor', { connection: redisConnection 
 
 // Helper: Descarga desde Evolution API y sube a Cloudflare R2
 async function asegurarImagenEnR2(hashLargo, rawPayload, instancia) {
-  const checkDb = await pool.query(
-    `SELECT url_imagen FROM impactos_raw WHERE hash_largo = $1 AND url_imagen IS NOT NULL LIMIT 1`,
-    [hashLargo]
-  );
+  // A. Verificar si ya existe en R2 (Protegido contra errores SQL)
+  try {
+    const checkDb = await pool.query(
+      `SELECT url_imagen FROM impactos_raw WHERE hash_largo = $1 AND url_imagen IS NOT NULL LIMIT 1`,
+      [hashLargo]
+    );
 
-  if (checkDb.rows.length > 0 && checkDb.rows[0].url_imagen) {
-    return checkDb.rows[0].url_imagen;
+    if (checkDb.rows.length > 0 && checkDb.rows[0].url_imagen) {
+      return checkDb.rows[0].url_imagen;
+    }
+  } catch (err) {
+    console.warn(`[Validador ⚠️] Verificación en impactos_raw omitida: ${err.message}`);
   }
 
+  // B. Extraer objeto de mensaje con resolución flexible de propiedades
   const item = Array.isArray(rawPayload) ? rawPayload[0] : rawPayload;
   const body = item?.body || item || {};
-  const data = body?.data || {};
-  const key = data?.key || {};
-  const message = data?.message || {};
+  const data = body?.data || item?.data || body || {};
+  const key = data?.key || item?.key || body?.key || {};
+  const message = data?.message || item?.message || body?.message || {};
 
   console.log(`[Validador] ☁️ Descargando imagen desde Evolution API para Hash: ${hashLargo.slice(-8)}...`);
-  const imageBuffer = await obtenerBufferImagen(instancia, data?.instanceId, key, message);
+  const imageBuffer = await obtenerBufferImagen(instancia, data?.instanceId || item?.instanceId, key, message);
 
   if (!imageBuffer) {
     console.error(`[Validador ⚠️] No se pudo obtener el buffer de la imagen para Hash: ${hashLargo}`);
@@ -71,7 +77,7 @@ async function asegurarImagenEnR2(hashLargo, rawPayload, instancia) {
 const worker = new Worker('cola-validador', async (job) => {
   const payload = job.data;
 
-  // Normalización de Hash
+  // Normalización de Hash (soporta snake_case y camelCase)
   const hashLargo = payload.hash_largo || payload.hashLargo;
   const hashCorto = payload.hash_corto || payload.hashCorto || (hashLargo ? hashLargo.slice(-8) : null);
 
@@ -92,7 +98,9 @@ const worker = new Worker('cola-validador', async (job) => {
     const urlR2 = await asegurarImagenEnR2(hashLargo, rawPayload, instancia);
 
     if (urlR2 && impactoId) {
-      await pool.query(`UPDATE impactos_raw SET url_imagen = $1 WHERE id = $2`, [urlR2, impactoId]);
+      await pool.query(`UPDATE impactos_raw SET url_imagen = $1 WHERE id = $2`, [urlR2, impactoId]).catch(err => {
+        console.warn(`[Validador ⚠️] No se actualizó url_imagen en impactos_raw: ${err.message}`);
+      });
     }
 
     // B. Actualizar o Insertar en registros_raw (Conteo acumulativo)
