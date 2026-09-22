@@ -1,5 +1,10 @@
+const { Queue } = require('bullmq');
 const pool = require('../config/db');
+const redisConfig = require('../config/redis');
 const { resolverUrlImagen } = require('../utils/imageResolver');
+
+// Instanciar la cola extractor para reprocesamiento
+const colaExtractor = new Queue('cola-extractor', { connection: redisConfig });
 
 async function getInstancias(req, res) {
   try {
@@ -128,8 +133,50 @@ async function deleteComprobante(req, res) {
   }
 }
 
+async function releerIA(req, res) {
+  try {
+    const { hash } = req.params;
+
+    // 1. Obtener datos del comprobante desde comprobantes_raw
+    const { rows } = await pool.query(
+      'SELECT hash_largo, url_r2, instancia FROM comprobantes_raw WHERE hash_largo = $1',
+      [hash]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Comprobante no encontrado' });
+    }
+
+    const comprobante = rows[0];
+
+    // 2. Marcar en estado RE-PROCESANDO
+    await pool.query(
+      `UPDATE comprobantes_raw 
+       SET estado_ia = 'RE-PROCESANDO', procesado_ia = false 
+       WHERE hash_largo = $1`,
+      [hash]
+    );
+
+    // 3. Enviar a la cola de BullMQ para el microservicio extractor
+    await colaExtractor.add('reprocesar-comprobante', {
+      hash_largo: comprobante.hash_largo,
+      url_r2: comprobante.url_r2,
+      instancia: comprobante.instancia
+    }, {
+      attempts: 3,
+      removeOnComplete: true
+    });
+
+    return res.json({ success: true, message: 'Re-lectura enviada a la cola' });
+  } catch (err) {
+    console.error('Error al solicitar re-lectura IA:', err.message);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+}
+
 module.exports = {
   getInstancias,
   getComprobantes,
-  deleteComprobante
+  deleteComprobante,
+  releerIA
 };
