@@ -137,31 +137,41 @@ async function releerIA(req, res) {
   try {
     const { hash } = req.params;
 
-    // 1. Obtener datos del comprobante desde comprobantes_raw
+    // 1. Buscar imagen cruzando impactos_raw y comprobantes_raw
     const { rows } = await pool.query(
-      'SELECT hash_largo, url_r2, instancia FROM comprobantes_raw WHERE hash_largo = $1',
+      `SELECT 
+         i.hash_largo, 
+         COALESCE(c.url_r2, i.url_imagen) as url_r2, 
+         COALESCE(c.instancia, i.instancia) as instancia,
+         i.caption
+       FROM impactos_raw i
+       LEFT JOIN comprobantes_raw c ON i.hash_largo = c.hash_largo
+       WHERE i.hash_largo = $1 OR c.hash_largo = $1
+       LIMIT 1`,
       [hash]
     );
 
     if (rows.length === 0) {
-      return res.status(404).json({ success: false, error: 'Comprobante no encontrado' });
+      return res.status(404).json({ success: false, error: 'Comprobante no encontrado en BD' });
     }
 
     const comprobante = rows[0];
 
-    // 2. Marcar en estado RE-PROCESANDO
+    // 2. Crear o actualizar estado en comprobantes_raw (UPSERT)
     await pool.query(
-      `UPDATE comprobantes_raw 
-       SET estado_ia = 'RE-PROCESANDO', procesado_ia = false 
-       WHERE hash_largo = $1`,
-      [hash]
+      `INSERT INTO comprobantes_raw (hash_largo, url_r2, instancia, estado_ia, procesado_ia)
+       VALUES ($1, $2, $3, 'RE-PROCESANDO', false)
+       ON CONFLICT (hash_largo) 
+       DO UPDATE SET estado_ia = 'RE-PROCESANDO', procesado_ia = false`,
+      [comprobante.hash_largo, comprobante.url_r2, comprobante.instancia]
     );
 
     // 3. Enviar a la cola de BullMQ para el microservicio extractor
-    await colaExtractor.add('reprocesar-comprobante', {
+    await colaExtractor.add('extraer-datos', {
       hash_largo: comprobante.hash_largo,
       url_r2: comprobante.url_r2,
-      instancia: comprobante.instancia
+      instancia: comprobante.instancia,
+      caption: comprobante.caption
     }, {
       attempts: 3,
       removeOnComplete: true
