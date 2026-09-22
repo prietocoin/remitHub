@@ -10,7 +10,8 @@ const worker = new Worker('cola-extractor', async (job) => {
   console.log(`[Extractor] 🧠 Analizando con Gemini para Hash: ${hash_largo?.slice(-8) || hash_largo}`);
 
   try {
-    const keyObjetivoR2 = key_r2 || (url_r2 ? url_r2.split('.dev/')[1] : null) || `comprobantes/${hash_largo}.jpg`;
+    // Extracción segura de la clave en R2 (funciona con cualquier dominio o clave directa)
+    const keyObjetivoR2 = key_r2 || (url_r2 ? decodeURIComponent(url_r2.replace(/^https?:\/\/[^\/]+\//, '')) : null) || `comprobantes/${hash_largo}.jpg`;
 
     // 1. Obtener imagen desde Cloudflare R2
     const command = new GetObjectCommand({
@@ -23,18 +24,9 @@ const worker = new Worker('cola-extractor', async (job) => {
     const imageBase64 = Buffer.from(byteArray).toString('base64');
     const mimeType = s3Response.ContentType || 'image/jpeg';
 
-    // 2. Ejecutar inferencia con la IA
-    const prompt = `Eres un sistema quirúrgico experto en auditoría y extracción de datos financieros. Tu salida debe ser ÚNICAMENTE un objeto JSON válido, sin bloques de código (\`\`\`json) ni texto adicional.
-${caption ? `Caption adjunto al mensaje: "${caption}"` : ''}
-
-Extrae los campos de este comprobante de pago o transferencia con este formato exacto:
-{
-  "monto": number o null,
-  "moneda": string o null (ej. "USD", "VES", "PEN", "EUR", "CLP"),
-  "banco": string o null,
-  "referencia": string o null,
-  "titular": string o null
-}`;
+    // 2. Inferencia con la IA usando SYSTEM_PROMPT del .env
+    const basePrompt = process.env.SYSTEM_PROMPT || 'Extrae los datos del comprobante en un JSON válido.';
+    const prompt = caption ? `${basePrompt}\n\nCaption adjunto al mensaje: "${caption}"` : basePrompt;
 
     const datos_ia = await extraerDatosConGemini(prompt, mimeType, imageBase64);
 
