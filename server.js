@@ -28,3 +28,5 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`[remitHub] 📊 Bull-Board activo en: http://localhost:${PORT}/admin/queues`);
   console.log(`[remitHub] 👁️ Dashboard activo en: http://localhost:${PORT}/`);
 });
+// remitHub/server.js
+require('./src/workers/pipeline.worker');
