@@ -1,8 +1,13 @@
+const { Queue } = require('bullmq');
 const pool = require('../../../config/db');
+const redisConfig = require('../../../config/redis');
 const { normalizarHashWhatsApp } = require('../services/hash');
 
-async function procesarWebhookIngesta(req, res, pipelineQueue) {
-  // 1. Responder 200 de inmediato
+// Instancia única de la cola pipeline para la ingesta
+const pipelineQueue = new Queue('cola-pipeline', { connection: redisConfig });
+
+async function procesarWebhookIngesta(req, res) {
+  // 1. Responder 200 de inmediato a Evolution API
   res.status(200).json({ status: 'received', timestamp: Date.now() });
 
   try {
@@ -13,15 +18,16 @@ async function procesarWebhookIngesta(req, res, pipelineQueue) {
     const message = data?.message || {};
     const imageMsg = message?.imageMessage;
 
+    // Ignorar mensajes que no sean imágenes
     if (!imageMsg && data?.messageType !== 'imageMessage') {
       return;
     }
 
-    // 2. Normalizar Hash
+    // 2. Normalizar Hash del comprobante
     const hashLargo = normalizarHashWhatsApp(imageMsg?.fileSha256, key?.id);
     const hashCorto = hashLargo ? hashLargo.slice(-8) : null;
 
-    // 3. Metadatos
+    // 3. Extraer Metadatos
     const instancia = body?.instance || data?.instance || 'DEFAULT';
     const usuarioRaw = key?.participantAlt || key?.participant || key?.remoteJid || null;
     const grupoRaw = key?.participant ? key?.remoteJid : null;
