@@ -37,44 +37,61 @@ async function extraerDatosConGemini(prompt, mimeType, imageBase64) {
     throw new Error('No hay llaves de API de Gemini configuradas.');
   }
 
-  // Se toma estrictamente el modelo definido en tu .env (remueve el prefijo "models/" si existiera)
-  const rawModel = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
-  const cleanModel = rawModel.replace(/^models\//, '').trim();
+  // Modelo preferido del .env
+  const rawModel = (process.env.GEMINI_MODEL || 'gemini-3.8-flash-lite').replace(/^models\//, '').trim();
+
+  // Lista en cascada para rotar modelos automáticamente en caso de error HTTP 503/429
+  const listaModelosPila = [
+    rawModel,
+    'gemini-3.8-flash-lite',
+    'gemini-3.8-flash',
+    'gemini-3.7-flash-lite',
+    'gemini-3.6-flash-lite',
+    'gemini-3.5-flash-lite',
+    'gemini-1.5-flash'
+  ];
+
+  // Filtrar duplicados manteniendo orden de prioridad
+  const modelosUnicos = [...new Set(listaModelosPila)];
 
   let ultimoError = null;
-  const maxIntentosKeys = Math.min(geminiKeyList.length, 3);
 
-  // Reintenta rotando las llaves de API si alguna da error
-  for (let intentoKey = 0; intentoKey < maxIntentosKeys; intentoKey++) {
-    const activeKey = getNextActiveKey();
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${cleanModel}:generateContent?key=${activeKey}`;
+  // Itera por la cascada de modelos (3.8 -> 3.7 -> 3.6 -> 3.5)
+  for (const model of modelosUnicos) {
+    const maxIntentosKeys = Math.min(geminiKeyList.length, 3);
 
-    try {
-      const response = await axios.post(url, {
-        contents: [{
-          parts: [
-            { text: prompt },
-            { inline_data: { mime_type: mimeType, data: imageBase64 } }
-          ]
-        }],
-        generationConfig: { 
-          responseMimeType: "application/json",
-          temperature: 0.1 
-        }
-      }, { timeout: 35000 });
+    // Itera rotando las llaves de API configuradas
+    for (let intentoKey = 0; intentoKey < maxIntentosKeys; intentoKey++) {
+      const activeKey = getNextActiveKey();
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${activeKey}`;
 
-      const textResult = response.data?.candidates?.[0]?.content?.parts?.[0]?.text;
-      
-      return parsearJSONSeguro(textResult);
+      try {
+        const response = await axios.post(url, {
+          contents: [{
+            parts: [
+              { text: prompt },
+              { inline_data: { mime_type: mimeType, data: imageBase64 } }
+            ]
+          }],
+          generationConfig: { 
+            responseMimeType: "application/json",
+            temperature: 0.1 
+          }
+        }, { timeout: 35000 });
 
-    } catch (err) {
-      ultimoError = err;
-      const status = err.response?.status;
-      console.warn(`[Gemini Service ⚠️] Petición con el modelo "${cleanModel}" falló (HTTP ${status || 'Err'}): ${err.message}`);
+        const textResult = response.data?.candidates?.[0]?.content?.parts?.[0]?.text;
+        
+        return parsearJSONSeguro(textResult);
+
+      } catch (err) {
+        ultimoError = err;
+        const status = err.response?.status;
+        console.warn(`[Gemini Service ⚠️] Modelo "${model}" con Key #${intentoKey + 1} falló (HTTP ${status || 'Err'}): ${err.message}`);
+      }
     }
   }
 
-  throw new Error(`Gemini falló tras reintentar con las claves de la API: ${ultimoError?.message}`);
+  throw new Error(`Gemini falló tras probar todos los modelos de respaldo (3.8, 3.7, 3.6, 3.5) y claves: ${ultimoError?.message}`);
 }
 
 module.exports = { extraerDatosConGemini };
