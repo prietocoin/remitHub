@@ -23,19 +23,27 @@ async function procesarWebhookIngesta(req, res) {
       return;
     }
 
-    // 2. Normalizar Hash del comprobante
+    // 2. Extraer e identificar la instancia
+    const instancia = body?.instance || data?.instance || 'DEFAULT';
+    const instanciaNorm = instancia.trim().toLowerCase();
+
+    // 🔴 FILTRO: Ignorar instancias 'John' / 'Jhon'
+    if (instanciaNorm === 'john' || instanciaNorm === 'jhon') {
+      return;
+    }
+
+    // 3. Normalizar Hash del comprobante
     const hashLargo = normalizarHashWhatsApp(imageMsg?.fileSha256, key?.id);
     const hashCorto = hashLargo ? hashLargo.slice(-8) : null;
 
-    // 3. Extraer Metadatos
-    const instancia = body?.instance || data?.instance || 'DEFAULT';
+    // 4. Extraer Metadatos
     const usuarioRaw = key?.participantAlt || key?.participant || key?.remoteJid || null;
     const grupoRaw = key?.participant ? key?.remoteJid : null;
     const nombrePush = data?.pushName || body?.nombre_push || 'Desconocido';
     const caption = imageMsg?.caption || message?.conversation || '';
     const timestampMsg = Number(data?.messageTimestamp || Math.floor(Date.now() / 1000));
 
-    // 4. Inserción inmutable en DB
+    // 5. Inserción inmutable en DB
     const query = `
       INSERT INTO impactos_raw 
         (hash_largo, hash_corto, instancia, usuario_raw, grupo_raw, nombre_push, caption, timestamp_msg)
@@ -47,9 +55,9 @@ async function procesarWebhookIngesta(req, res) {
     const { rows } = await pool.query(query, values);
     const impactoId = rows[0].id;
 
-    console.log(`[remitHub Ingesta] 📥 Impacto #${impactoId} registrado en DB (Hash: ${hashCorto})`);
+    console.log(`[remitHub Ingesta] 📥 Impacto #${impactoId} registrado en DB (Instancia: ${instancia} | Hash: ${hashCorto})`);
 
-    // 5. Encolar en el pipeline unificado de remitHub
+    // 6. Encolar en el pipeline unificado de remitHub
     await pipelineQueue.add('procesar-comprobante', {
       impactoId,
       hashLargo,
