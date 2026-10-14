@@ -93,7 +93,7 @@ async function getComprobantes(req, res) {
       LEFT JOIN comprobantes_raw c ON i.hash_largo = c.hash_largo
       ${filtroConteo}
       ORDER BY i.timestamp_msg DESC
-      LIMIT 60
+      LIMIT 500
     `;
 
     const { rows } = await pool.query(query, [instanciaTarget]);
