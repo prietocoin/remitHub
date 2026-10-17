@@ -22,7 +22,7 @@ async function getInstancias(req, res) {
 
 async function getComprobantes(req, res) {
   try {
-    const instanciaTarget = req.query.instancia || 'JAIRO';
+    const instanciaTarget = req.query.instancia || 'GLAUK';
     const soloBinomios = req.query.solo_binomios === 'true';
 
     let filtroConteo = '';
