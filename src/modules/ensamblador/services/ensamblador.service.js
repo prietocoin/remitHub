@@ -46,7 +46,7 @@ async function procesarEnsambladoDatos(payload) {
 
     return {
       hash_largo,
-      instancia: instancia || 'JAIRO',
+      instancia: instancia || 'GLAUK',
       datos_finales: datos
     };
 
