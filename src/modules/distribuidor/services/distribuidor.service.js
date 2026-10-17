@@ -51,7 +51,7 @@ async function procesarDistribucion(payloadWorker) {
       identificadores: {
         hash_largo,
         hash_corto: hashCorto,
-        instancia: instancia || 'JAIRO'
+        instancia: instancia || 'GLAUK'
       },
       extraccion_ia: {
         monto: datosIA.monto ?? null,
