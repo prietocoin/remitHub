@@ -33,7 +33,7 @@ function renderDashboard(req, res) {
         <div class="flex items-center gap-2 bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5">
           <label for="select-instancia" class="text-xs font-semibold text-slate-400">Instancia:</label>
           <select id="select-instancia" onchange="cambiarInstancia(this.value)" class="bg-transparent text-sky-400 font-bold text-sm focus:outline-none cursor-pointer">
-            <option value="JAIRO" class="bg-slate-900 text-white">JAIRO</option>
+            <option value="GLAUK" class="bg-slate-900 text-white">GLAUK</option>
           </select>
         </div>
 
@@ -50,7 +50,7 @@ function renderDashboard(req, res) {
 
   <script>
     const urlParams = new URLSearchParams(window.location.search);
-    let INSTANCIA_ACTUAL = urlParams.get('instancia') || 'JAIRO';
+    let INSTANCIA_ACTUAL = urlParams.get('instancia') || 'GLAUK';
     let SOLO_BINOMIOS = urlParams.get('filtro') === 'binomios';
 
     document.getElementById('select-filtro').value = SOLO_BINOMIOS ? 'binomios' : 'todos';
