@@ -83,7 +83,7 @@ async function procesarValidadorBinomio(payload) {
     RETURNING conteo, url_imagen, estado;
   `, [
     hashLargo, hashCorto, grupoRaw || '', usuarioRaw || '', nombrePush || 'Desconocido',
-    caption || '', timestampMsg || Math.floor(Date.now() / 1000), instancia || 'JAIRO', urlR2
+    caption || '', timestampMsg || Math.floor(Date.now() / 1000), instancia || 'GLAUK', urlR2
   ]);
 
   const registro = rows[0];
@@ -103,7 +103,7 @@ async function procesarValidadorBinomio(payload) {
         ON CONFLICT (hash_largo) DO UPDATE SET 
           url_r2 = COALESCE(EXCLUDED.url_r2, comprobantes_raw.url_r2),
           estado_ia = 'LISTO_PARA_IA';
-      `, [hashLargo, instancia || 'JAIRO', urlR2 || registro.url_imagen || null]);
+      `, [hashLargo, instancia || 'GLAUK', urlR2 || registro.url_imagen || null]);
 
       await client.query(`
         UPDATE registros_raw SET estado = 'EN_COLA' WHERE hash_largo = $1;
@@ -112,7 +112,7 @@ async function procesarValidadorBinomio(payload) {
       await client.query('COMMIT');
       
       // Retornamos true para indicar que este registro SÍ debe pasar a la IA (Extractor)
-      return { procesarIA: true, hashLargo, instancia: instancia || 'JAIRO', urlR2: urlR2 || registro.url_imagen };
+      return { procesarIA: true, hashLargo, instancia: instancia || 'GLAUK', urlR2: urlR2 || registro.url_imagen };
 
     } catch (dbErr) {
       await client.query('ROLLBACK');
